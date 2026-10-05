@@ -184,8 +184,9 @@ If your changes affect the source generator output or public APIs:
 4. Commit the `.verified.txt` files with your changes
 
 The `.Net4_7` snapshots come from a .NET Framework leg that only builds on Windows. On Linux and macOS,
-push your change and take the `*.received.*` files from the `ReceivedSnapshots-windows-latest` artifact
-of the failed CI run.
+a change to generator or public API output will therefore fail the Windows CI leg until those snapshots
+are updated: push your change and take the `*.received.*` files from the `ReceivedSnapshots-windows-latest`
+artifact of the failed run.
 
 #### Performance Considerations
 

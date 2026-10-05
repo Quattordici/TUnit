@@ -40,7 +40,7 @@ public class PublishMockTestsAOTModule : Module<IReadOnlyList<CommandResult>>
                 return await context.DotNet().Publish(new DotNetPublishOptions
                 {
                     ProjectSolution = testProject.Path,
-                    Runtime = RuntimeIdentifiers.Current,
+                    Arguments = ["--use-current-runtime"],
                     Configuration = "Release",
                     Output = Path.Combine(rootDir, $"MOCKTESTS_AOT_{framework}"),
                     Properties =

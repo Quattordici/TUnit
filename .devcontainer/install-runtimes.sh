@@ -7,7 +7,9 @@ dotnet_root="$(dirname "$(readlink -f "$(command -v dotnet)")")"
 installer="$(mktemp)"
 trap 'rm -f "$installer"' EXIT
 
-curl -sSL https://dot.net/v1/dotnet-install.sh -o "$installer"
+# Microsoft's official installer, fetched over HTTPS and unpinned like the image's own SDK tag;
+# --fail turns an HTTP error into a clear failure instead of running an error page.
+curl --fail -sSL https://dot.net/v1/dotnet-install.sh -o "$installer"
 
 for channel in 8.0 9.0 10.0; do
     for runtime in dotnet aspnetcore; do

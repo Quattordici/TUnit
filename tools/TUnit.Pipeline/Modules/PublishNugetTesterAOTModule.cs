@@ -41,7 +41,7 @@ public class PublishNugetTesterAOTModule : Module<IReadOnlyList<CommandResult>>
                 return await context.DotNet().Publish(new DotNetPublishOptions
                 {
                     ProjectSolution = testProject.Path,
-                    Runtime = RuntimeIdentifiers.Current,
+                    Arguments = ["--use-current-runtime"],
                     Configuration = "Release",
                     Output = $"NUGETTESTER_AOT_{framework}",
                     Properties =
