@@ -207,6 +207,15 @@ internal sealed class PropertyInjector
 
             // Recurse into nested properties
             await RecurseIntoNestedPropertiesAsync(instance, plan, objectBag, methodMetadata, events, visitedObjects, cancellationToken);
+
+            // Recurse into objects passed to the constructor by a class-level ClassDataSource attribute
+            if (ClassDataSourceConstructorResolver.TryGetDependencies(instance, out var constructorDependencies))
+            {
+                foreach (var dependency in constructorDependencies)
+                {
+                    await RecurseIntoPropertyValueAsync(dependency, objectBag, methodMetadata, events, visitedObjects, cancellationToken);
+                }
+            }
         }
         catch (Exception ex)
         {

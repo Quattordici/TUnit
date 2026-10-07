@@ -257,6 +257,9 @@ internal sealed class ObjectGraphDiscoverer : IObjectGraphTracker
 
         // Also discover nested IAsyncInitializer objects from ALL properties
         TraverseInitializerProperties(obj, TryAddStandard, Recurse, currentDepth, cancellationToken);
+
+        // And objects passed to its constructor by a class-level ClassDataSource attribute
+        TraverseConstructorDependencies(obj, TryAddStandard, Recurse, currentDepth);
     }
 
     /// <summary>
@@ -309,6 +312,9 @@ internal sealed class ObjectGraphDiscoverer : IObjectGraphTracker
 
         // Also discover nested IAsyncInitializer objects from ALL properties
         TraverseInitializerProperties(obj, TryAddTracking, Recurse, currentDepth, cancellationToken);
+
+        // And objects passed to its constructor by a class-level ClassDataSource attribute
+        TraverseConstructorDependencies(obj, TryAddTracking, Recurse, currentDepth);
     }
 
     /// <summary>
@@ -334,8 +340,11 @@ internal sealed class ObjectGraphDiscoverer : IObjectGraphTracker
     /// collections, a set and several closures — for the common plain test class.
     /// Mirrors the traversal rules of <see cref="DiscoverNestedObjects"/> exactly.
     /// </summary>
-    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = "Reflection fallback mirrors TraverseInitializerPropertiesViaReflection.")]
     internal static bool MayHaveNestedObjects(Type type)
+        => MayHaveNestedObjectsCached(type) || ClassDataSourceConstructorResolver.IsConstructedType(type);
+
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = "Reflection fallback mirrors TraverseInitializerPropertiesViaReflection.")]
+    private static bool MayHaveNestedObjectsCached(Type type)
         => MayHaveNestedObjectsCache.GetOrAdd(type, static t =>
         {
             if (PropertyInjectionCache.GetOrCreatePlan(t).HasProperties)
@@ -534,6 +543,30 @@ internal sealed class ObjectGraphDiscoverer : IObjectGraphTracker
 
         // No source-gen registration anywhere in the hierarchy → fall back to reflection.
         TraverseInitializerPropertiesViaReflection(obj, type, tryAdd, recurse, currentDepth, cancellationToken);
+    }
+
+    /// <summary>
+    /// Traverses the objects that <see cref="ClassDataSourceConstructorResolver"/> passed to <paramref name="obj"/>'s
+    /// constructor, so they are initialized before, and disposed after, the object that depends on them.
+    /// </summary>
+    private static void TraverseConstructorDependencies(
+        object obj,
+        TryAddObjectFunc tryAdd,
+        RecurseFunc recurse,
+        int currentDepth)
+    {
+        if (!ClassDataSourceConstructorResolver.TryGetDependencies(obj, out var dependencies))
+        {
+            return;
+        }
+
+        foreach (var dependency in dependencies)
+        {
+            if (dependency is not null && tryAdd(dependency, currentDepth))
+            {
+                recurse(dependency, currentDepth + 1);
+            }
+        }
     }
 
     /// <summary>

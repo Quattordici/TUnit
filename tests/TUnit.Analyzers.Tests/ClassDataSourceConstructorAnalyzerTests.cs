@@ -407,4 +407,122 @@ public class ClassDataSourceConstructorAnalyzerTests
                 """
             );
     }
+
+    [Test]
+    public async Task No_Error_When_Constructor_Arguments_Come_From_Class_Level_ClassDataSource()
+    {
+        await Verifier
+            .VerifyAnalyzerAsync(
+                """
+                using TUnit.Core;
+
+                [ClassDataSource<NatsContainer>(Shared = SharedType.PerTestSession)]
+                public class MyClass(NatsContainer container)
+                {
+                    [Test]
+                    public void MyTest()
+                    {
+                    }
+                }
+
+                [ClassDataSource<DockerNetwork>(Shared = SharedType.PerTestSession)]
+                public class NatsContainer(DockerNetwork network)
+                {
+                    public DockerNetwork Network => network;
+                }
+
+                public class DockerNetwork;
+                """
+            );
+    }
+
+    [Test]
+    public async Task No_Error_When_Multiple_Constructor_Arguments_Come_From_Generic_Class_Level_ClassDataSource()
+    {
+        await Verifier
+            .VerifyAnalyzerAsync(
+                """
+                using TUnit.Core;
+
+                public class MyClass
+                {
+                    [ClassDataSource<Container>]
+                    public required Container Container { get; init; }
+
+                    [Test]
+                    public void MyTest()
+                    {
+                    }
+                }
+
+                [ClassDataSource<Network, Volume>]
+                public class Container(Network network, Volume volume);
+
+                public class Network;
+
+                public class Volume;
+                """
+            );
+    }
+
+    [Test]
+    public async Task No_Error_When_Multiple_Constructor_Arguments_Come_From_NonGeneric_Class_Level_ClassDataSource()
+    {
+        await Verifier
+            .VerifyAnalyzerAsync(
+                """
+                using TUnit.Core;
+
+                public class MyClass
+                {
+                    [ClassDataSource<Container>]
+                    public required Container Container { get; init; }
+
+                    [Test]
+                    public void MyTest()
+                    {
+                    }
+                }
+
+                [ClassDataSource(typeof(Network), typeof(Volume))]
+                public class Container(Network network, Volume volume);
+
+                public class Network;
+
+                public class Volume;
+                """
+            );
+    }
+
+    [Test]
+    public async Task Error_When_Class_Level_ClassDataSource_Does_Not_Match_Constructor_Parameter_Count()
+    {
+        var expected = Verifier.Diagnostic(Rules.NoAccessibleConstructor)
+            .WithLocation(0)
+            .WithArguments("Container");
+
+        await Verifier
+            .VerifyAnalyzerAsync(
+                """
+                using TUnit.Core;
+
+                public class MyClass
+                {
+                    [{|#0:ClassDataSource<Container>|}]
+                    public required Container Container { get; init; }
+
+                    [Test]
+                    public void MyTest()
+                    {
+                    }
+                }
+
+                [ClassDataSource<Network>]
+                public class Container(Network network, string name);
+
+                public class Network;
+                """,
+                expected
+            );
+    }
 }

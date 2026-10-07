@@ -108,8 +108,10 @@ public class ClassDataSourceConstructorAnalyzer : ConcurrentDiagnosticAnalyzer
             return;
         }
 
-        // Check if there's an accessible parameterless constructor
-        if (!HasAccessibleParameterlessConstructor(namedType, context.Compilation))
+        // Check if there's an accessible parameterless constructor, or a constructor whose
+        // arguments are supplied by a class-level ClassDataSource attribute on the type itself
+        if (!HasAccessibleParameterlessConstructor(namedType, context.Compilation)
+            && !HasConstructorDataSource(namedType))
         {
             context.ReportDiagnostic(
                 Diagnostic.Create(
@@ -117,6 +119,58 @@ public class ClassDataSourceConstructorAnalyzer : ConcurrentDiagnosticAnalyzer
                     attribute.GetLocation() ?? context.Symbol.Locations.FirstOrDefault(),
                     namedType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)));
         }
+    }
+
+    /// <summary>
+    /// A type without a parameterless constructor can still be created when it declares exactly one
+    /// class-level ClassDataSource attribute and has a public constructor taking that many parameters,
+    /// e.g. <c>[ClassDataSource&lt;Network&gt;] public class Container(Network network)</c>.
+    /// </summary>
+    private static bool HasConstructorDataSource(INamedTypeSymbol type)
+    {
+        int? dependencyCount = null;
+
+        foreach (var attribute in type.GetAttributes())
+        {
+            if (attribute.AttributeClass is not { Name: "ClassDataSourceAttribute" } attributeClass
+                || attributeClass.ContainingNamespace?.ToDisplayString() != "TUnit.Core")
+            {
+                continue;
+            }
+
+            var count = attributeClass.IsGenericType
+                ? attributeClass.TypeArguments.Length
+                : CountTypeArguments(attribute);
+
+            if (count == 0)
+            {
+                continue;
+            }
+
+            if (dependencyCount is not null)
+            {
+                // Several class-level data sources describe several data rows, not one set of constructor arguments
+                return false;
+            }
+
+            dependencyCount = count;
+        }
+
+        return dependencyCount is not null
+            && type.InstanceConstructors.Any(c => c.DeclaredAccessibility == Accessibility.Public
+                && c.Parameters.Length == dependencyCount);
+    }
+
+    private static int CountTypeArguments(AttributeData attribute)
+    {
+        var count = 0;
+
+        foreach (var argument in attribute.ConstructorArguments)
+        {
+            count += argument.Kind == TypedConstantKind.Array ? argument.Values.Length : 1;
+        }
+
+        return count;
     }
 
     private static bool HasAccessibleParameterlessConstructor(INamedTypeSymbol type, Compilation compilation)

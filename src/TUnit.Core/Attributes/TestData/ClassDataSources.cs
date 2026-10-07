@@ -44,11 +44,11 @@ internal class ClassDataSources
     {
         return sharedType switch
         {
-            SharedType.None => Create<T>(),
-            SharedType.PerTestSession => (T) TestDataContainer.GetGlobalInstance(typeof(T), _ => Create(typeof(T)))!,
-            SharedType.PerClass => (T) TestDataContainer.GetInstanceForClass(testClassType, typeof(T), _ => Create(typeof(T)))!,
-            SharedType.Keyed => (T) TestDataContainer.GetInstanceForKey(key, typeof(T), _ => CreateWithKey(typeof(T), key))!,
-            SharedType.PerAssembly => (T) TestDataContainer.GetInstanceForAssembly(testClassType.Assembly, typeof(T), _ => Create(typeof(T)))!,
+            SharedType.None => Create<T>(dataGeneratorMetadata),
+            SharedType.PerTestSession => (T) TestDataContainer.GetGlobalInstance(typeof(T), _ => Create(typeof(T), dataGeneratorMetadata))!,
+            SharedType.PerClass => (T) TestDataContainer.GetInstanceForClass(testClassType, typeof(T), _ => Create(typeof(T), dataGeneratorMetadata))!,
+            SharedType.Keyed => (T) TestDataContainer.GetInstanceForKey(key, typeof(T), _ => CreateWithKey(typeof(T), key, dataGeneratorMetadata))!,
+            SharedType.PerAssembly => (T) TestDataContainer.GetInstanceForAssembly(testClassType.Assembly, typeof(T), _ => Create(typeof(T), dataGeneratorMetadata))!,
             _ => throw new ArgumentOutOfRangeException()
         };
     }
@@ -57,18 +57,18 @@ internal class ClassDataSources
     {
         return sharedType switch
         {
-            SharedType.None => Create(type),
-            SharedType.PerTestSession => TestDataContainer.GetGlobalInstance(type, _ => Create(type)),
-            SharedType.PerClass => TestDataContainer.GetInstanceForClass(testClassType, type, _ => Create(type)),
-            SharedType.Keyed => TestDataContainer.GetInstanceForKey(key!, type, _ => CreateWithKey(type, key!)),
-            SharedType.PerAssembly => TestDataContainer.GetInstanceForAssembly(testClassType.Assembly, type, _ => Create(type)),
+            SharedType.None => Create(type, dataGeneratorMetadata),
+            SharedType.PerTestSession => TestDataContainer.GetGlobalInstance(type, _ => Create(type, dataGeneratorMetadata)),
+            SharedType.PerClass => TestDataContainer.GetInstanceForClass(testClassType, type, _ => Create(type, dataGeneratorMetadata)),
+            SharedType.Keyed => TestDataContainer.GetInstanceForKey(key!, type, _ => CreateWithKey(type, key!, dataGeneratorMetadata)),
+            SharedType.PerAssembly => TestDataContainer.GetInstanceForAssembly(testClassType.Assembly, type, _ => Create(type, dataGeneratorMetadata)),
             _ => throw new ArgumentOutOfRangeException()
         };
     }
 
-    private static object CreateWithKey([DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] Type type, string key)
+    private static object CreateWithKey([DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] Type type, string key, DataGeneratorMetadata dataGeneratorMetadata)
     {
-        var instance = Create(type);
+        var instance = Create(type, dataGeneratorMetadata);
 
         if (instance is IKeyedDataSource keyed)
         {
@@ -79,16 +79,22 @@ internal class ClassDataSources
     }
 
     [return: NotNull]
-    private static T Create<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>()
+    private static T Create<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(DataGeneratorMetadata dataGeneratorMetadata)
     {
-        return ((T) Create(typeof(T)))!;
+        return ((T) Create(typeof(T), dataGeneratorMetadata))!;
     }
 
-    private static object Create([DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] Type type)
+    private static object Create([DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] Type type, DataGeneratorMetadata dataGeneratorMetadata)
     {
         try
         {
             // Just create the instance - initialization happens in the Engine
+            if (ClassDataSourceConstructorResolver.HasConstructorDataSources(type))
+            {
+                // Constructor arguments come from a class-level ClassDataSource attribute on the type
+                return ClassDataSourceConstructorResolver.CreateInstance(type, dataGeneratorMetadata);
+            }
+
             return Activator.CreateInstance(type)!;
         }
         catch (TargetInvocationException targetInvocationException)

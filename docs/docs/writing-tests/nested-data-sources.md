@@ -23,7 +23,7 @@ This typically leads to complex setup code with manual initialization chains.
 
 TUnit automatically initializes nested data sources in the correct order using any data source attribute that implements `IDataSourceAttribute` (such as `[ClassDataSource<T>]`).
 
-Declare nested data sources on properties. Constructor-injected dependencies inside a data source type are not currently supported because `ClassDataSource<T>` requires that type to have a public parameterless constructor.
+Declare nested data sources on properties, or receive them through the constructor of the data source type (see [Constructor Injection](#constructor-injection)).
 
 ## Basic Example
 
@@ -185,6 +185,52 @@ public sealed class PostgresTestContainer { }
 public sealed class LocalStackContainer { }
 ```
 
+## Constructor Injection
+
+A data source type can also take its dependencies through its constructor. Put a `[ClassDataSource]` attribute on the type itself to supply the constructor's arguments, the same way you would on a test class:
+
+```csharp
+public sealed class DockerNetwork : IAsyncInitializer, IAsyncDisposable
+{
+    public string Name { get; private set; } = "";
+
+    public Task InitializeAsync()
+    {
+        Name = "test-network";
+        return Task.CompletedTask;
+    }
+
+    public ValueTask DisposeAsync() => default;
+}
+
+[ClassDataSource<DockerNetwork>(Shared = SharedType.PerTestSession)]
+public sealed class NatsContainer(DockerNetwork network) : IAsyncInitializer, IAsyncDisposable
+{
+    public string ConnectionString { get; private set; } = "";
+
+    public Task InitializeAsync()
+    {
+        // The network has already been initialized at this point
+        ConnectionString = $"nats://{network.Name}:4222";
+        return Task.CompletedTask;
+    }
+
+    public ValueTask DisposeAsync() => default;
+}
+
+[ClassDataSource<NatsContainer>(Shared = SharedType.PerTestSession)]
+public class MessagingTests(NatsContainer nats)
+{
+    [Test]
+    public async Task Publishes_Message()
+    {
+        await Assert.That(nats.ConnectionString).StartsWith("nats://");
+    }
+}
+```
+
+Constructor dependencies behave like property dependencies: each one is shared according to its own `Shared` setting, it is initialized before the object that receives it, and it is disposed after that object. To pass several arguments, use a single attribute with several types, such as `[ClassDataSource<DockerNetwork, DockerVolume>]`. The type must not have a public parameterless constructor, because that constructor is used when one exists.
+
 ## Sharing Resources
 
 Expensive resources like test containers should be shared across tests using the `Shared` parameter:
@@ -228,7 +274,7 @@ public class ProductApiTests
 
 ## How It Works
 
-1. TUnit detects properties marked with data source attributes (like `[ClassDataSource<T>]`)
+1. TUnit detects properties marked with data source attributes (like `[ClassDataSource<T>]`), and constructor arguments supplied by a class-level `[ClassDataSource]` attribute on a data source type
 2. It builds a dependency graph and initializes in the correct order
 3. Each object's `InitializeAsync` is called after its dependencies are ready
 4. Disposal happens in reverse order automatically

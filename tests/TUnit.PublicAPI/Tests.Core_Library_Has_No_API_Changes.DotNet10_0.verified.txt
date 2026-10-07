@@ -347,6 +347,10 @@ namespace
         public .<string> GetKeys() { }
         public .<.SharedType> GetSharedTypes() { }
     }
+    public static class ClassDataSourceConstructorRegistry
+    {
+        public static int Register( type, <.IDataSourceAttribute> createDataSource, <object?[], object> createInstance) { }
+    }
     [.DebuggerDisplay("{}")]
     public class ClassHookContext : .Context
     {

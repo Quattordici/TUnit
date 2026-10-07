@@ -23,6 +23,7 @@ public sealed class PropertyInjectionSourceGenerator : IIncrementalGenerator
     public const string PropertyDataSourcesStep = "PropertyInjection_PropertyDataSources";
     public const string AsyncInitializersStep = "PropertyInjection_AsyncInitializers";
     public const string ConcreteGenericTypesStep = "PropertyInjection_ConcreteGenericTypes";
+    public const string ConstructorDataSourcesStep = "PropertyInjection_ConstructorDataSources";
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
@@ -117,7 +118,165 @@ public sealed class PropertyInjectionSourceGenerator : IIncrementalGenerator
                 GenerateGenericInitializerPropertySource(ctx, model);
             }
         });
+
+        // Pipeline 6: Find ClassDataSource types whose constructor arguments come from a class-level ClassDataSource attribute
+        var constructorDataSources = context.SyntaxProvider
+            .CreateSyntaxProvider(
+                predicate: static (node, _) => node is ClassDeclarationSyntax { AttributeLists.Count: > 0 },
+                transform: static (ctx, _) => ExtractConstructorDataSourceModel(ctx))
+            .Where(static x => x is not null)
+            .Select(static (x, _) => x!)
+            .WithTrackingName(ConstructorDataSourcesStep);
+
+        var constructorDataSourcesWithEnabled = constructorDataSources
+            .Collect()
+            .SelectMany(static (models, _) => models.Distinct())
+            .Combine(enabledProvider);
+
+        context.RegisterSourceOutput(constructorDataSourcesWithEnabled, static (ctx, data) =>
+        {
+            var (model, isEnabled) = data;
+            if (!isEnabled)
+                return;
+            GenerateConstructorDataSource(ctx, model);
+        });
     }
+
+    #region Constructor Data Source Extraction
+
+    /// <summary>
+    /// Matches a non-test type with no public parameterless constructor whose single class-level
+    /// ClassDataSource attribute supplies the arguments of one of its public constructors, e.g.
+    /// <c>[ClassDataSource&lt;Network&gt;] public class Container(Network network)</c>.
+    /// </summary>
+    private static ConstructorDataSourceModel? ExtractConstructorDataSourceModel(GeneratorSyntaxContext context)
+    {
+        if (context.SemanticModel.GetDeclaredSymbol(context.Node) is not INamedTypeSymbol typeSymbol)
+            return null;
+
+        if (typeSymbol.IsAbstract || typeSymbol.IsStatic || typeSymbol.TypeParameters.Length > 0)
+            return null;
+
+        if (!IsPubliclyAccessible(typeSymbol))
+            return null;
+
+        if (typeSymbol.InstanceConstructors.Any(c => c.Parameters.Length == 0 && c.DeclaredAccessibility == Accessibility.Public))
+            return null;
+
+        AttributeData? dataSourceAttribute = null;
+        var dependencyCount = 0;
+
+        foreach (var attribute in typeSymbol.GetAttributes())
+        {
+            if (attribute.AttributeClass is not { Name: "ClassDataSourceAttribute" } attributeClass
+                || attributeClass.ContainingNamespace?.ToDisplayString() != "TUnit.Core")
+            {
+                continue;
+            }
+
+            var count = attributeClass.IsGenericType
+                ? attributeClass.TypeArguments.Length
+                : attribute.ConstructorArguments.Sum(a => a.Kind == TypedConstantKind.Array ? a.Values.Length : 1);
+
+            if (count == 0)
+                continue;
+
+            // Several class-level data sources describe several data rows, not one set of constructor arguments
+            if (dataSourceAttribute is not null)
+                return null;
+
+            dataSourceAttribute = attribute;
+            dependencyCount = count;
+        }
+
+        if (dataSourceAttribute is null)
+            return null;
+
+        // Test classes receive their constructor arguments from the test builder instead
+        if (HasTestMethods(typeSymbol))
+            return null;
+
+        var constructor = typeSymbol.InstanceConstructors
+            .FirstOrDefault(c => c.DeclaredAccessibility == Accessibility.Public && c.Parameters.Length == dependencyCount);
+
+        if (constructor is null)
+            return null;
+
+        return new ConstructorDataSourceModel
+        {
+            TypeFullyQualified = typeSymbol.GloballyQualified(),
+            SafeTypeName = GetSafeClassName(typeSymbol),
+            AttributeTypeName = dataSourceAttribute.AttributeClass!.GloballyQualified(),
+            ConstructorArgs = new EquatableArray<string>(dataSourceAttribute.ConstructorArguments.Select(FormatTypedConstant).ToArray()),
+            NamedArgs = new EquatableArray<NamedArgModel>(dataSourceAttribute.NamedArguments
+                .Select(na => new NamedArgModel
+                {
+                    Name = na.Key,
+                    FormattedValue = FormatTypedConstant(na.Value)
+                })
+                .ToArray()),
+            ParameterTypes = new EquatableArray<string>(constructor.Parameters.Select(p => p.Type.GloballyQualified()).ToArray())
+        };
+    }
+
+    private static bool HasTestMethods(INamedTypeSymbol typeSymbol)
+    {
+        for (var type = typeSymbol; type is not null; type = type.BaseType)
+        {
+            foreach (var member in type.GetMembers())
+            {
+                if (member is not IMethodSymbol method)
+                    continue;
+
+                foreach (var attribute in method.GetAttributes())
+                {
+                    if (attribute.AttributeClass?.BaseType?.GloballyQualified() == WellKnownFullyQualifiedClassNames.BaseTestAttribute.WithGlobalPrefix)
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static void GenerateConstructorDataSource(SourceProductionContext context, ConstructorDataSourceModel model)
+    {
+        var stableHash = FileNameHelper.GetStableHashCode(model.TypeFullyQualified).ToString("x8", CultureInfo.InvariantCulture);
+        var fileName = $"{model.SafeTypeName}_ConstructorDataSource.g.cs";
+
+        var sb = new StringBuilder();
+        WriteGeneratedFileHeader(sb);
+
+        // Contribute a static field initializer to the shared TUnit_PropertyRegistration partial
+        // instead of a per-type [ModuleInitializer]. All contributions merge into one .cctor.
+        // The explicit attribute construction keeps the dependency types' constructors when trimming.
+        sb.AppendLine("namespace TUnit.Generated");
+        sb.AppendLine("{");
+        sb.AppendLine("internal static partial class TUnit_PropertyRegistration");
+        sb.AppendLine("{");
+        sb.AppendLine($"    static readonly int _r_{model.SafeTypeName}_CtorDataSource_{stableHash} = global::TUnit.Core.ClassDataSourceConstructorRegistry.Register(");
+        sb.AppendLine($"        typeof({model.TypeFullyQualified}),");
+        sb.AppendLine("        static () =>");
+        sb.AppendLine("        {");
+        sb.AppendLine($"            var dataSource = new {model.AttributeTypeName}({string.Join(", ", model.ConstructorArgs)});");
+
+        foreach (var namedArg in model.NamedArgs)
+        {
+            sb.AppendLine($"            dataSource.{namedArg.Name} = {namedArg.FormattedValue};");
+        }
+
+        sb.AppendLine("            return dataSource;");
+        sb.AppendLine("        },");
+
+        var arguments = string.Join(", ", model.ParameterTypes.Select((type, i) => $"({type})args[{i.ToString(CultureInfo.InvariantCulture)}]!"));
+        sb.AppendLine($"        static args => new {model.TypeFullyQualified}({arguments}));");
+        sb.AppendLine("}");
+        sb.AppendLine("}");
+
+        context.AddSource(fileName, sb.ToString());
+    }
+
+    #endregion
 
     #region Property Data Source Extraction
 

@@ -9,7 +9,7 @@ public sealed class ClassDataSourceAttribute<
     [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.NonPublicProperties)] T2,
     [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.NonPublicProperties)] T3,
     [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.NonPublicProperties)] T4>
-    : DataSourceGeneratorAttribute<T1, T2, T3, T4>, ITraceScopeProvider
+    : DataSourceGeneratorAttribute<T1, T2, T3, T4>, ITraceScopeProvider, IClassDataSourceArgumentProvider
     where T1 : new()
     where T2 : new()
     where T3 : new()
@@ -39,4 +39,12 @@ public sealed class ClassDataSourceAttribute<
     public IEnumerable<SharedType> GetSharedTypes() => Shared;
 
     public IEnumerable<string> GetKeys() => Keys;
+
+    Type[] IClassDataSourceArgumentProvider.DependencyTypes => [typeof(T1), typeof(T2), typeof(T3), typeof(T4)];
+
+    object?[] IClassDataSourceArgumentProvider.CreateArguments(DataGeneratorMetadata dataGeneratorMetadata)
+    {
+        var (item1, item2, item3, item4) = GenerateDataSources(dataGeneratorMetadata).First()();
+        return [item1, item2, item3, item4];
+    }
 }

@@ -454,7 +454,7 @@
         <value>Data source may produce no tests</value>
     </data>
     <data name="TUnit0061Description" xml:space="preserve">
-        <value>ClassDataSource&lt;T&gt; requires that type T has an accessible parameterless constructor. Add a public or internal parameterless constructor to the type, or use IAsyncInitializer for initialization logic.</value>
+        <value>ClassDataSource&lt;T&gt; requires that type T has an accessible parameterless constructor. Add a public or internal parameterless constructor to the type, use IAsyncInitializer for initialization logic, or supply the constructor's arguments with a single class-level [ClassDataSource] attribute on the type.</value>
     </data>
     <data name="TUnit0061MessageFormat" xml:space="preserve">
         <value>Type '{0}' does not have an accessible parameterless constructor required by ClassDataSource&lt;T&gt;</value>

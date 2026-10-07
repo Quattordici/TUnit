@@ -30,6 +30,8 @@ internal static class PropertyInjectionCache
 
     /// <summary>
     /// Checks if a type has injectable properties using caching.
+    /// Also true for types created with constructor dependencies from a class-level ClassDataSource attribute,
+    /// since those dependencies may have injectable properties of their own.
     /// </summary>
     public static bool HasInjectableProperties(Type type)
     {
@@ -37,6 +39,6 @@ internal static class PropertyInjectionCache
         {
             var plan = GetOrCreatePlan(t);
             return plan.HasProperties;
-        });
+        }) || ClassDataSourceConstructorResolver.IsConstructedType(type);
     }
 }
