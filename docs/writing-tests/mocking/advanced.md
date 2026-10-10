@@ -464,7 +464,7 @@ The provider is consulted **before** auto-mocking and built-in smart defaults.
 
 ## Reset[​](#reset "Direct link to Reset")
 
-Clear all setups, call history, state, and auto-tracked property values:
+Clear all setups, call history, state, and auto-tracked property values. For class mocks it also restores `PassThrough` to its default of `true`:
 
 ```
 mock.GetUser(Any()).Returns(new User("Alice"));
@@ -506,7 +506,7 @@ svc.GetUser(1);                            // setup kept: still returns Alice
 mock.GetUser(1).WasCalled(Times.Once);     // counts only the call after the clear
 ```
 
-Setups, state, auto-tracked property values and event subscriptions are kept. Each setup's invoke count is reset, so `VerifyAll()` and diagnostics only count calls made after the clear. The call history of cached auto-mocks is cleared too. `MockRepository.ClearCalls()` clears every tracked mock. The instance-style `mock.ClearCalls()` is available on net9 and later; on net8 and older target frameworks use `Mock.ClearCalls(mock)`.
+Setups, state, auto-tracked property values and event subscriptions are kept. Each setup's invoke count is reset, so `VerifyAll()` and diagnostics only count calls made after the clear. Sequenced setups (such as `ReturnsSequentially`) keep their position; only the count used by `VerifyAll()` and diagnostics is reset. The call history of cached auto-mocks is cleared too. `MockRepository.ClearCalls()` clears every tracked mock. The instance-style `mock.ClearCalls()` is available on net9 and later; on net8 and older target frameworks use `Mock.ClearCalls(mock)`.
 
 ## Call Base on Class Mocks[​](#call-base-on-class-mocks "Direct link to Call Base on Class Mocks")
 
