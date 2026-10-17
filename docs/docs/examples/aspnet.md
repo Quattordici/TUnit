@@ -1175,6 +1175,26 @@ public class WebApplicationFactory : TestWebApplicationFactory<Program>
 | `ConfigureStartupConfiguration` | Before Program.cs | Configuration needed during app startup |
 | `ConfigureWebHost` + `ConfigureAppConfiguration` | After Program.cs | Configuration only needed after app starts |
 
+### How do I test against a real Kestrel server?
+
+**Problem:** The default in-memory `TestServer` handles every request itself, so a client that follows a redirect to another host, or a tool that needs a real socket, cannot reach it.
+
+**Solution:** On .NET 10, call `UseKestrel` in the factory. Each test's isolated application then listens on its own loopback port, and `Factory.CreateClient()` targets it. Pass port `0` so that tests running in parallel each get a free port:
+
+```csharp
+using TUnit.AspNetCore;
+
+public class KestrelWebApplicationFactory : TestWebApplicationFactory<Program>
+{
+    public KestrelWebApplicationFactory()
+    {
+        UseKestrel(0);
+    }
+}
+```
+
+`Factory.Server` is not available in Kestrel mode; use `Factory.Services` instead.
+
 ## API Reference
 
 ### WebApplicationTest Properties

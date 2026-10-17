@@ -42,8 +42,16 @@ public abstract class TestWebApplicationFactory<TEntryPoint> : WebApplicationFac
     {
         lock (_isolationLock)
         {
-            return WithWebHostBuilder(builder =>
+            WebApplicationFactory<TEntryPoint>? isolatedFactory = null;
+
+            isolatedFactory = WithWebHostBuilder(builder =>
             {
+#if NET10_0_OR_GREATER
+                // Runs while the isolated host is built, after this factory's ConfigureWebHost,
+                // so UseKestrel calls made there are seen too.
+                KestrelFactoryState<TEntryPoint>.Inherit(this, isolatedFactory!);
+#endif
+
                 var configurationBuilder = new ConfigurationManager();
                 ConfigureStartupConfiguration(configurationBuilder);
 
@@ -92,6 +100,8 @@ public abstract class TestWebApplicationFactory<TEntryPoint> : WebApplicationFac
 
                 configureWebHostBuilder?.Invoke(builder);
             });
+
+            return isolatedFactory;
         }
     }
 
@@ -222,6 +232,28 @@ public abstract class TestWebApplicationFactory<TEntryPoint> : WebApplicationFac
 
         return descriptor;
     }
+
+#if NET10_0_OR_GREATER
+    /// <summary>
+    /// Configures clients created by this factory and by factories derived from it with
+    /// <see cref="WebApplicationFactory{TEntryPoint}.WithWebHostBuilder"/>, which delegate to this method.
+    /// When this factory uses Kestrel but has not started its own server, the call comes from a derived
+    /// factory and the base implementation would throw (dotnet/aspnetcore#69655). The client is left
+    /// unchanged: the derived factory's <c>CreateClient</c>, and
+    /// <see cref="TracedWebApplicationFactory{TEntryPoint}.CreateDefaultClient(DelegatingHandler[])"/>,
+    /// point it at the derived factory's own server.
+    /// </summary>
+    protected override void ConfigureClient(HttpClient client)
+    {
+        if (KestrelFactoryState<TEntryPoint>.UsesKestrel(this)
+            && KestrelFactoryState<TEntryPoint>.ServerAddress(this) is null)
+        {
+            return;
+        }
+
+        base.ConfigureClient(client);
+    }
+#endif
 
     /// <summary>
     /// Creates an <see cref="HttpClient"/> with <see cref="ActivityPropagationHandler"/> and

@@ -59,7 +59,18 @@ public sealed class TracedWebApplicationFactory<TEntryPoint> : IAsyncDisposable,
     /// </summary>
     public HttpClient CreateDefaultClient(params DelegatingHandler[] handlers)
     {
-        return _inner.CreateDefaultClient(TUnitHttpClientFilter.PrependPropagationHandlers(handlers));
+        var client = _inner.CreateDefaultClient(TUnitHttpClientFilter.PrependPropagationHandlers(handlers));
+
+#if NET10_0_OR_GREATER
+        // A factory derived with WithWebHostBuilder configures its clients through the parent factory,
+        // which cannot know the derived Kestrel server's address (dotnet/aspnetcore#69655).
+        if (KestrelFactoryState<TEntryPoint>.ServerAddress(_inner) is { } serverAddress)
+        {
+            client.BaseAddress = serverAddress;
+        }
+#endif
+
+        return client;
     }
 
     /// <summary>
