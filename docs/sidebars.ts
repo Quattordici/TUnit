@@ -167,6 +167,7 @@ const sidebars: SidebarsConfig = {
         'execution/repeating',
         'execution/ci-cd-reporting',
         'guides/report-aggregation',
+        'guides/test-trends',
         'execution/engine-modes',
         'writing-tests/aot',
         'guides/performance',
