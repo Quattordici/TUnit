@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <Import Project="..\..\eng\TestProject.props" />
+
+    <ItemGroup>
+      <!-- The tool is an executable; reference it to run its commands in-process. -->
+      <ProjectReference Include="..\..\src\TUnit.Reporting.Tool\TUnit.Reporting.Tool.csproj" />
+    </ItemGroup>
+
+    <Import Project="..\..\eng\TestProject.targets" />
+
+</Project>

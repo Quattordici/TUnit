@@ -25,6 +25,8 @@ A machine-readable JSON sidecar (`{AssemblyName}-{os}-{tfm}.tunit-report.json`) 
 
 Running many test projects and want **one combined report instead of one per project**? See [Aggregated Reports](/docs/guides/report-aggregation).
 
+Want to see how tests behave **across runs**, such as pass rate, duration and newly failing tests? See [Test Trends](/docs/guides/test-trends).
+
 ## Features
 
 - **Summary Dashboard** — Total, passed, failed, skipped, and cancelled counts with a visual pass-rate donut chart
