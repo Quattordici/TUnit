@@ -12,8 +12,8 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>tunit-report</ToolCommandName>
     <PackageId>TUnit.Reporting.Tool</PackageId>
-    <Description>Merges TUnit test report sidecars from multiple test projects, target frameworks or CI jobs into a single HTML report and GitHub Actions step summary.</Description>
-    <PackageTags>testing;tunit;report;aggregation;dotnet-tool</PackageTags>
+    <Description>Merges TUnit test report sidecars from multiple test projects, target frameworks or CI jobs into a single HTML report and GitHub Actions step summary, and keeps a run history to show test trends over time.</Description>
+    <PackageTags>testing;tunit;report;aggregation;trends;dotnet-tool</PackageTags>
   </PropertyGroup>
 
   <!-- The merge pipeline is compiled from the engine's own sources rather than referencing
@@ -37,6 +37,11 @@
     <Compile Include="..\TUnit.Engine\Reporters\Aggregation\ReportDataMerger.cs" Link="Linked\ReportDataMerger.cs" />
     <Compile Include="..\TUnit.Engine\Reporters\Aggregation\AggregatedSummaryWriter.cs" Link="Linked\AggregatedSummaryWriter.cs" />
     <Compile Include="..\TUnit.Engine\Reporters\Aggregation\GitHubSummaryRegion.cs" Link="Linked\GitHubSummaryRegion.cs" />
+    <Compile Include="..\TUnit.Engine\Reporters\History\RunRecord.cs" Link="Linked\RunRecord.cs" />
+    <Compile Include="..\TUnit.Engine\Reporters\History\RunHistoryJson.cs" Link="Linked\RunHistoryJson.cs" />
+    <Compile Include="..\TUnit.Engine\Reporters\History\FileRunHistoryStore.cs" Link="Linked\FileRunHistoryStore.cs" />
+    <Compile Include="..\TUnit.Engine\Reporters\History\RunHistoryAnalyzer.cs" Link="Linked\RunHistoryAnalyzer.cs" />
+    <Compile Include="..\TUnit.Engine\Reporters\History\TrendsHtmlGenerator.cs" Link="Linked\TrendsHtmlGenerator.cs" />
     <!-- LogicalName must match HtmlReportGenerator.TemplateResourceName exactly. -->
     <EmbeddedResource Include="..\TUnit.Engine\Reporters\Html\TestReport.template.html">
       <LogicalName>TUnit.Engine.Reporters.Html.TestReport.template.html</LogicalName>
