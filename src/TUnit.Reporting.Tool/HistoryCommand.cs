@@ -9,16 +9,25 @@ internal static class HistoryCommand
 {
     internal const int DefaultKeep = 200;
 
-    internal static int Run(string[] args)
+    /// <summary>
+    /// Suite name for a run merged from a directory. Fixed rather than derived from the merged
+    /// report ("3 Test Suites"), so adding a test project doesn't break every test's history.
+    /// </summary>
+    internal const string DirectorySuiteName = "All tests";
+
+    internal static int Run(string[] args, ToolContext context)
     {
         if (args.Length < 2 || args[1] != "append")
         {
-            Console.Error.WriteLine("error: expected 'tunit-report history append'.");
+            context.Error.WriteLine("error: expected 'tunit-report history append'.");
             return 2;
         }
 
         string? report = null;
         string? store = null;
+        string? suite = null;
+        string? commit = null;
+        string? branch = null;
         var keep = DefaultKeep;
 
         for (var i = 2; i < args.Length; i++)
@@ -34,32 +43,50 @@ internal static class HistoryCommand
                 case "--keep":
                     keep = OptionReader.RequirePositiveInt(args, ref i);
                     break;
+                case "--suite":
+                    suite = OptionReader.RequireValue(args, ref i);
+                    break;
+                case "--commit":
+                    commit = OptionReader.RequireValue(args, ref i);
+                    break;
+                case "--branch":
+                    branch = OptionReader.RequireValue(args, ref i);
+                    break;
                 default:
-                    Console.Error.WriteLine($"error: unknown option '{args[i]}'.");
+                    context.Error.WriteLine($"error: unknown option '{args[i]}'.");
                     return 2;
             }
         }
 
         if (report is null || store is null)
         {
-            Console.Error.WriteLine("error: --report and --store are required.");
+            context.Error.WriteLine("error: --report and --store are required.");
             return 2;
         }
 
-        if (LoadReport(Path.GetFullPath(report)) is not { } data)
+        if (LoadReport(Path.GetFullPath(report), context) is not { } loaded)
         {
             return 2;
         }
 
-        var run = RunRecord.FromReport(data, DateTimeOffset.UtcNow);
+        var recorded = RunRecord.FromReport(loaded.Data, context.UtcNow());
+        var run = recorded with
+        {
+            Suite = suite ?? loaded.Suite,
+            // An overridden commit invalidates the detected commit link.
+            CommitSha = commit ?? recorded.CommitSha,
+            CommitUrl = commit is null ? recorded.CommitUrl : null,
+            Branch = branch ?? recorded.Branch,
+        };
+
         var historyStore = new FileRunHistoryStore(Path.GetFullPath(store));
         if (historyStore.Append(run, keep))
         {
-            Console.WriteLine($"Appended run of {run.Suite} ({run.Counts.Total} tests) to {historyStore.FilePath}.");
+            context.Out.WriteLine($"Appended run of {run.Suite} ({run.Counts.Total} tests) to {historyStore.FilePath}.");
         }
         else
         {
-            Console.WriteLine($"Run of {run.Suite} at {run.Timestamp:u} is already in {historyStore.FilePath}; nothing appended.");
+            context.Out.WriteLine($"Run of {run.Suite} at {run.Timestamp:u} is already in {historyStore.FilePath}; nothing appended.");
         }
 
         return 0;
@@ -67,31 +94,37 @@ internal static class HistoryCommand
 
     // A directory is merged into one run, so a CI job with several test projects
     // (or target frameworks) adds a single point to the trend.
-    private static ReportData? LoadReport(string path)
+    private static (ReportData Data, string Suite)? LoadReport(string path, ToolContext context)
     {
         if (Directory.Exists(path))
         {
-            var (suites, _) = SidecarLoader.Load(path);
+            var (suites, skipped) = SidecarLoader.Load(path);
             if (suites.Count == 0)
             {
-                Console.Error.WriteLine($"error: no TUnit report sidecars (*{ReportDataJson.SidecarExtension}) found under {path}.");
+                context.Error.WriteLine($"error: no TUnit report sidecars (*{ReportDataJson.SidecarExtension}) found under {path}.");
                 return null;
             }
-            return ReportDataMerger.Merge(suites);
+
+            if (skipped > 0)
+            {
+                context.Out.WriteLine($"warning: skipped {skipped} unreadable or incompatible sidecar file(s).");
+            }
+
+            return (ReportDataMerger.Merge(suites), DirectorySuiteName);
         }
 
         if (!File.Exists(path))
         {
-            Console.Error.WriteLine($"error: report not found: {path}");
+            context.Error.WriteLine($"error: report not found: {path}");
             return null;
         }
 
         if (ReportDataJson.TryDeserialize(File.ReadAllBytes(path)) is { } data)
         {
-            return data;
+            return (data, data.AssemblyName);
         }
 
-        Console.Error.WriteLine($"error: {path} is not a readable TUnit report sidecar.");
+        context.Error.WriteLine($"error: {path} is not a readable TUnit report sidecar.");
         return null;
     }
 }

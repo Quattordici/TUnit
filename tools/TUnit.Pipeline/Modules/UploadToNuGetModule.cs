@@ -27,6 +27,7 @@ namespace TUnit.Pipeline.Modules;
 // so a release has to.
 [DependsOn<RunAnalyzersTestsModule>]
 [DependsOn<RunUnitTestsModule>]
+[DependsOn<RunReportingToolTestsModule>]
 [DependsOn<RunTemplateTestsModule>]
 [DependsOn<RunAspNetTestsModule>(Optional = true)]
 [DependsOn<RunAssertionsTestsModule>]

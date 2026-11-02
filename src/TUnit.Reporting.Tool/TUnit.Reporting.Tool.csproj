@@ -16,6 +16,10 @@
     <PackageTags>testing;tunit;report;aggregation;trends;dotnet-tool</PackageTags>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="TUnit.Reporting.Tool.Tests" />
+  </ItemGroup>
+
   <!-- The merge pipeline is compiled from the engine's own sources rather than referencing
        TUnit.Engine: the tool must stay a tiny, dependency-free executable (TUnit.Engine drags
        in Microsoft.Testing.Platform), and the shared source guarantees the tool reads exactly
@@ -42,6 +46,9 @@
     <Compile Include="..\TUnit.Engine\Reporters\History\FileRunHistoryStore.cs" Link="Linked\FileRunHistoryStore.cs" />
     <Compile Include="..\TUnit.Engine\Reporters\History\RunHistoryAnalyzer.cs" Link="Linked\RunHistoryAnalyzer.cs" />
     <Compile Include="..\TUnit.Engine\Reporters\History\TrendsHtmlGenerator.cs" Link="Linked\TrendsHtmlGenerator.cs" />
+    <Compile Include="..\TUnit.Engine\Reporters\History\CommitLink.cs" Link="Linked\CommitLink.cs" />
+    <Compile Include="..\TUnit.Engine\Reporters\History\TrendFormat.cs" Link="Linked\TrendFormat.cs" />
+    <Compile Include="..\TUnit.Engine\Reporters\History\TrendsMarkdownGenerator.cs" Link="Linked\TrendsMarkdownGenerator.cs" />
     <!-- LogicalName must match HtmlReportGenerator.TemplateResourceName exactly. -->
     <EmbeddedResource Include="..\TUnit.Engine\Reporters\Html\TestReport.template.html">
       <LogicalName>TUnit.Engine.Reporters.Html.TestReport.template.html</LogicalName>
