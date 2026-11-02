@@ -20,11 +20,15 @@ internal interface IRunHistoryStore
 /// <summary>
 /// Run history as a JSON Lines file (<c>history.jsonl</c>) in a directory, e.g. one that CI
 /// restores and saves with a cache step. Writes go through <see cref="AtomicFile"/> so a
-/// killed append never truncates the existing history.
+/// killed append never truncates the existing history, and appends hold an exclusive lock
+/// file so concurrent appends (parallel jobs on one machine) never drop each other's runs.
 /// </summary>
 internal sealed class FileRunHistoryStore : IRunHistoryStore
 {
     internal const string FileName = "history.jsonl";
+
+    private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan LockRetryDelay = TimeSpan.FromMilliseconds(25);
 
     public FileRunHistoryStore(string directory)
     {
@@ -61,6 +65,9 @@ internal sealed class FileRunHistoryStore : IRunHistoryStore
             throw new ArgumentOutOfRangeException(nameof(keep), keep, "Must keep at least one run.");
         }
 
+        Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+        using var appendLock = AcquireLock();
+
         var runs = Load().ToList();
         var key = run.Key;
         if (runs.Any(r => r.Key == key))
@@ -77,9 +84,27 @@ internal sealed class FileRunHistoryStore : IRunHistoryStore
             content.Append(RunHistoryJson.Serialize(r)).Append('\n');
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
         // GetBytes writes no byte-order mark, keeping every line plain JSON for line-based tools.
         AtomicFile.WriteAllBytes(FilePath, Encoding.UTF8.GetBytes(content.ToString()));
         return true;
+    }
+
+    // Read-modify-write must not interleave: FileShare.None is an exclusive lock across
+    // processes (flock on Unix), and also between two opens within one process.
+    private FileStream AcquireLock()
+    {
+        var lockPath = FilePath + ".lock";
+        var deadline = DateTime.UtcNow + LockTimeout;
+        while (true)
+        {
+            try
+            {
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException) when (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(LockRetryDelay);
+            }
+        }
     }
 }

@@ -21,6 +21,9 @@ internal sealed record RunRecord(
     /// <summary>The write format of <see cref="ReportData.Timestamp"/>.</summary>
     internal const string ReportTimestampFormat = "dd MMM yyyy, HH:mm:ss 'UTC'";
 
+    /// <summary>Link to the commit's page on the source-control provider, when it could be derived.</summary>
+    internal string? CommitUrl { get; init; }
+
     /// <summary>Identifies a run so appending the same report twice is a no-op.</summary>
     internal string Key => $"{Timestamp.UtcTicks}|{Suite}|{CommitSha}";
 
@@ -49,7 +52,10 @@ internal sealed record RunRecord(
             report.PullRequestNumber,
             report.TotalDurationMs,
             new RunCounts(summary.Total, summary.Passed, summary.TotalFailed, summary.Skipped, summary.Cancelled, summary.Flaky),
-            tests);
+            tests)
+        {
+            CommitUrl = CommitLink.FromSourceLinks(report.SourceLinks, report.CommitSha),
+        };
     }
 
     internal static DateTimeOffset? TryParseReportTimestamp(string timestamp)

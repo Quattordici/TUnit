@@ -30,6 +30,7 @@ internal static class RunHistoryJson
             WriteOptionalString(w, "commit", run.CommitSha);
             WriteOptionalString(w, "branch", run.Branch);
             WriteOptionalString(w, "pr", run.PullRequestNumber);
+            WriteOptionalString(w, "commitUrl", run.CommitUrl);
             w.WriteNumber("durationMs", run.DurationMs);
 
             w.WriteStartObject("counts");
@@ -122,7 +123,10 @@ internal static class RunHistoryJson
             GetString(root, "pr"),
             GetDouble(root, "durationMs"),
             counts,
-            tests);
+            tests)
+        {
+            CommitUrl = GetString(root, "commitUrl"),
+        };
     }
 
     private static string StatusToString(TestRunStatus status) => status switch
