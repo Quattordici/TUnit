@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Collections.Immutable;
 using Microsoft.CodeAnalysis;
 using TUnit.Core.SourceGenerator.Extensions;
+using TUnit.Core.SourceGenerator.Helpers;
 
 namespace TUnit.Core.SourceGenerator.Utilities;
 
@@ -96,7 +97,7 @@ internal static class MetadataGenerationHelper
         // For concrete classes, only consider public constructors
         var constructor = typeSymbol.IsAbstract
             ? null
-            : typeSymbol.InstanceConstructors.FirstOrDefault(c => c.DeclaredAccessibility == Accessibility.Public);
+            : GetParameterConstructor(typeSymbol);
         var constructorParams = constructor?.Parameters ?? ImmutableArray<IParameterSymbol>.Empty;
         if (constructor != null && constructorParams.Length > 0)
         {
@@ -185,7 +186,7 @@ internal static class MetadataGenerationHelper
         // For concrete classes, only consider public constructors
         var constructor = typeSymbol.IsAbstract
             ? null
-            : typeSymbol.InstanceConstructors.FirstOrDefault(c => c.DeclaredAccessibility == Accessibility.Public);
+            : GetParameterConstructor(typeSymbol);
         var constructorParams = constructor?.Parameters ?? ImmutableArray<IParameterSymbol>.Empty;
         if (constructor != null && constructorParams.Length > 0)
         {
@@ -202,6 +203,34 @@ internal static class MetadataGenerationHelper
         writer.Append("})");
 
         return writer.ToString();
+    }
+
+    /// <summary>
+    /// The public constructor whose parameters describe the class metadata's <c>Parameters</c>: the one marked
+    /// <c>[TestConstructor]</c>, which the instance factory builds the test with, otherwise the first one. Reflection
+    /// mode picks the same constructor (<c>ClassMetadataHelper.GetParameterConstructor</c>).
+    /// </summary>
+    private static IMethodSymbol? GetParameterConstructor(INamedTypeSymbol typeSymbol)
+    {
+        IMethodSymbol? first = null;
+        foreach (var constructor in typeSymbol.InstanceConstructors)
+        {
+            if (constructor.DeclaredAccessibility != Accessibility.Public)
+            {
+                continue;
+            }
+
+            first ??= constructor;
+            foreach (var attribute in constructor.GetAttributes())
+            {
+                if (attribute.AttributeClass?.ToDisplayString() == WellKnownFullyQualifiedClassNames.TestConstructorAttribute.WithoutGlobalPrefix)
+                {
+                    return constructor;
+                }
+            }
+        }
+
+        return first;
     }
 
     /// <summary>
@@ -331,13 +360,13 @@ internal static class MetadataGenerationHelper
                 // Use reflection to get the value at runtime
                 ? $"_ => typeof({namedTypeSymbol.GloballyQualified()}).GetProperty(\"{property.Name}\")?.GetValue(null)"
                 // Use dynamic to avoid invalid cast to open generic type
-                : $"o => ((dynamic)o).{property.Name}";
+                : $"o => ((dynamic)o).{IdentifierHelper.Escape(property.Name)}";
         }
 
         var safeTypeName = namedTypeSymbol.GloballyQualified();
         return property.IsStatic
-            ? $"_ => {safeTypeName}.{property.Name}"
-            : $"o => (({safeTypeName})o).{property.Name}";
+            ? $"_ => {safeTypeName}.{IdentifierHelper.Escape(property.Name)}"
+            : $"o => (({safeTypeName})o).{IdentifierHelper.Escape(property.Name)}";
     }
 
     /// <summary>

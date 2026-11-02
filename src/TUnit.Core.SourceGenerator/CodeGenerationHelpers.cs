@@ -155,7 +155,11 @@ internal static class CodeGenerationHelpers
             if (hasGenericParameters)
             {
                 // Has generic parameters - use ConstructedGeneric
-                var genericDefType = GetTypeOfExpression(namedType.ConstructUnboundGenericType());
+                // The display format shortens an unbound Nullable<> to "T?", and typeof(T?) does not compile
+                // outside T's scope, so spell the open definition out.
+                var genericDefType = namedType.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T
+                    ? "typeof(global::System.Nullable<>)"
+                    : GetTypeOfExpression(namedType.ConstructUnboundGenericType());
                 var genericArgs = namedType.TypeArguments.Select(GenerateTypeInfo).ToArray();
 
                 using var writer = new CodeWriter("", includeHeader: false);
@@ -165,6 +169,13 @@ internal static class CodeGenerationHelpers
             }
             // All type arguments are concrete - this is just a concrete type
             // Fall through to regular typeof() handling
+        }
+
+        if (typeSymbol is IArrayTypeSymbol && ContainsTypeParameter(typeSymbol))
+        {
+            // An array of a type parameter (e.g. `params T[]`) has no TypeInfo variant, and typeof(T[])
+            // does not compile outside T's scope. Erase it to object, as the parameter's Type already is.
+            return "new global::TUnit.Core.ConcreteType(typeof(object))";
         }
 
         // Regular concrete type (including fully closed generic types like List<int>)
@@ -177,7 +188,10 @@ internal static class CodeGenerationHelpers
     /// </summary>
     private static string GetTypeOfExpression(ITypeSymbol typeSymbol)
     {
-        var fullyQualifiedName = typeSymbol.ToDisplayString(DisplayFormats.FullyQualifiedGenericWithGlobalPrefix);
+        // typeof(dynamic) does not compile (CS1962); dynamic is object at runtime.
+        var fullyQualifiedName = typeSymbol.TypeKind == TypeKind.Dynamic
+            ? "object"
+            : typeSymbol.ToDisplayString(DisplayFormats.FullyQualifiedGenericWithGlobalPrefix);
         return $"typeof({fullyQualifiedName})";
     }
 

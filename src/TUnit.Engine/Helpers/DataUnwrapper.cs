@@ -75,28 +75,80 @@ internal class DataUnwrapper
             return values;
         }
 
-        // Special case: If we have a single value that's a tuple, and a single parameter that expects a tuple,
-        // don't unwrap it
-        if (values.Length == 1 &&
-            expectedParameters.Length == 1 &&
-            DataSourceHelpers.IsTuple(values[0]) &&
-            TupleHelper.IsTupleType(expectedParameters[0].Type))
+        // Only a single tuple value is spread across the parameters
+        if (values.Length != 1 || !DataSourceHelpers.IsTuple(values[0]))
         {
             return values;
         }
 
-        // Otherwise use the default unwrapping
-        if (values.Length == 1 && DataSourceHelpers.IsTuple(values[0]))
+        // The engine supplies CancellationToken parameters wherever they are declared, so the row
+        // binds to the data parameters only.
+        var dataParameterCount = 0;
+        var firstDataParameterIndex = -1;
+        var lastDataParameterIndex = -1;
+        for (var i = 0; i < expectedParameters.Length; i++)
         {
-            var paramTypes = new Type[expectedParameters.Length];
-            for (var i = 0; i < expectedParameters.Length; i++)
+            if (expectedParameters[i].Type != typeof(CancellationToken))
             {
-                paramTypes[i] = expectedParameters[i].Type;
-            }
+                if (dataParameterCount == 0)
+                {
+                    firstDataParameterIndex = i;
+                }
 
-            return values[0].ToObjectArrayWithTypes(paramTypes);
+                dataParameterCount++;
+                lastDataParameterIndex = i;
+            }
         }
 
-        return values;
+        if (dataParameterCount == 0)
+        {
+            return DataSourceHelpers.UnwrapTupleAot(values[0]);
+        }
+
+        var lastDataParameterType = expectedParameters[lastDataParameterIndex].Type;
+
+        // A single data parameter that expects a tuple receives the tuple itself
+        if (dataParameterCount == 1 && TupleHelper.IsTupleType(lastDataParameterType))
+        {
+            return values;
+        }
+
+        // A tuple that is already an instance of the first data parameter's tuple type binds to it
+        // whole when every later data parameter can be omitted (optional or params).
+        var firstDataParameterType = expectedParameters[firstDataParameterIndex].Type;
+        if (dataParameterCount > 1
+            && TupleHelper.IsTupleType(firstDataParameterType)
+            && firstDataParameterType.IsInstanceOfType(values[0])
+            && RemainingDataParametersAreOmittable(expectedParameters, firstDataParameterIndex))
+        {
+            return values;
+        }
+
+        var elements = DataSourceHelpers.UnwrapTupleAot(values[0]);
+
+        // A trailing array data parameter collects every remaining element. Otherwise extra
+        // elements beyond the data parameters are dropped.
+        if (elements.Length <= dataParameterCount || lastDataParameterType is { IsArray: true } && lastDataParameterType.GetArrayRank() == 1)
+        {
+            return elements;
+        }
+
+        var capped = new object?[dataParameterCount];
+        Array.Copy(elements, capped, dataParameterCount);
+        return capped;
+    }
+
+    private static bool RemainingDataParametersAreOmittable(ParameterMetadata[] parameters, int firstDataParameterIndex)
+    {
+        for (var i = firstDataParameterIndex + 1; i < parameters.Length; i++)
+        {
+            var parameter = parameters[i];
+            if (parameter.Type != typeof(CancellationToken) && !parameter.IsOptional && !parameter.IsParams)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 }

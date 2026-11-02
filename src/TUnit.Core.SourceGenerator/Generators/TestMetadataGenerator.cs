@@ -7,6 +7,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
+using TUnit.Analyzers.Extensions;
 using TUnit.Core.SourceGenerator.CodeGenerators.Formatting;
 using TUnit.Core.SourceGenerator.CodeGenerators.Helpers;
 using TUnit.Core.SourceGenerator.CodeGenerators.Writers;
@@ -474,6 +475,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             .Replace(".g.cs", "_TestSource");
 
         List<ConcreteInstantiation> concreteInstantiations;
+        List<string> classConstraintViolations = [];
 
         if (!testMethod.IsGenericType && !testMethod.IsGenericMethod)
         {
@@ -494,13 +496,13 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         else
         {
             // Collect all concrete type instantiations for this generic test method
-            concreteInstantiations = CollectConcreteInstantiations(testMethod, className);
+            concreteInstantiations = CollectConcreteInstantiations(testMethod, className, out classConstraintViolations);
 
-            if (concreteInstantiations.Count == 0)
+            if (concreteInstantiations.Count == 0 && classConstraintViolations.Count == 0)
             {
-                // No concrete types could be resolved — skip this method.
-                // The test won't be discovered, which matches the behavior of
-                // not having any data to resolve type arguments.
+                // No concrete types could be resolved for a generic class — skip this method. A
+                // generic method on a non-generic class always gets an entry: rows whose type
+                // arguments cannot be inferred fail instead (#7163).
                 return;
             }
         }
@@ -622,6 +624,11 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             registrationIndex++;
         }
 
+        if (classConstraintViolations.Count > 0)
+        {
+            EmitClassConstraintViolationEntries(writer, testMethod, classConstraintViolations);
+        }
+
         writer.Unindent();
         writer.AppendLine("}");
 
@@ -633,7 +640,48 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 $"global::TUnit.Core.SourceRegistrar.RegisterEntries<{concreteClassName}>(static () => {uniqueClassName}.Entries_{registrationIndex.ToString(CultureInfo.InvariantCulture)})");
             registrationIndex++;
         }
+
+        if (classConstraintViolations.Count > 0)
+        {
+            EmitRegistrationField(writer, $"{uniqueClassName}_ConstraintViolations",
+                $"global::TUnit.Core.SourceRegistrar.RegisterGenericConstraintViolations(typeof({className}), static () => {uniqueClassName}.ConstraintViolations)");
+        }
     }
+
+    /// <summary>
+    /// Emits the test method's class type arguments that break the class's generic constraints. A
+    /// <c>TestEntry&lt;T&gt;</c> cannot be emitted for such a closed type, so the entry is registered
+    /// against the open generic type and the engine reports one failed test per message, the same
+    /// failures reflection mode reports (#7107).
+    /// </summary>
+    private static void EmitClassConstraintViolationEntries(CodeWriter writer, TestMethodMetadata testMethod, List<string> messages)
+    {
+        writer.AppendLine("public static readonly global::TUnit.Core.GenericConstraintViolationEntry[] ConstraintViolations = new global::TUnit.Core.GenericConstraintViolationEntry[]");
+        writer.AppendLine("{");
+        writer.Indent();
+        writer.AppendLine("new global::TUnit.Core.GenericConstraintViolationEntry");
+        writer.AppendLine("{");
+        writer.Indent();
+        writer.AppendLine($"MethodName = \"{EscapeString(testMethod.MethodSymbol.Name)}\",");
+        writer.AppendLine($"FilePath = {SymbolDisplay.FormatLiteral(testMethod.FilePath ?? "", quote: true)},");
+        writer.AppendLine($"LineNumber = {testMethod.LineNumber.ToString(CultureInfo.InvariantCulture)},");
+        writer.AppendLine("MethodMetadata = __mm_0,");
+        writer.AppendLine($"Messages = new string[] {{ {string.Join(", ", messages.Select(m => $"\"{EscapeString(m)}\""))} }},");
+        writer.Unindent();
+        writer.AppendLine("},");
+        writer.Unindent();
+        writer.AppendLine("};");
+    }
+
+    /// <summary>
+    /// The failure of a method-level [Arguments] row whose inferred class type arguments no class-level
+    /// [Arguments] row infers. Keep in step with <c>ReflectionTestDataCollector.NoClassRowForMethodRowMessage</c>
+    /// in TUnit.Engine, so both modes report the same message (#7118).
+    /// </summary>
+    private const string NoClassRowForMethodRowMessage =
+        "This method-level [Arguments] row infers class type arguments that none of the class-level data rows infer, " +
+        "so no class row supplies the constructor arguments for this instantiation. " +
+        "Add a class-level row with matching types, or change the method row to match an existing class row.";
 
     /// <summary>
     /// Represents a single concrete instantiation of a generic test.
@@ -649,34 +697,95 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         public AttributeData? SpecificArgumentsAttribute { get; init; }
 
         /// <summary>
+        /// True when <see cref="SpecificArgumentsAttribute"/> is a class-level [Arguments] row
+        /// rather than a method-level data source.
+        /// </summary>
+        public bool SpecificIsClassRow { get; init; }
+
+        /// <summary>
         /// Further method-level [Arguments] rows that infer the same type arguments as
         /// <see cref="SpecificArgumentsAttribute"/>. They share this instantiation, so each row
         /// still yields its own test instead of being dropped as a duplicate type combination.
         /// </summary>
         public List<AttributeData>? AdditionalArgumentsAttributes { get; set; }
 
+        /// <summary>
+        /// Further class-level [Arguments] rows that infer the same class type arguments. The engine
+        /// multiplies them by the method rows, so every class row runs against every method row (#7106).
+        /// </summary>
+        public List<AttributeData>? AdditionalClassArgumentsAttributes { get; set; }
+
         public bool HasParameterizedConstructor { get; init; }
 
-        public bool IsSpecificDataSource(AttributeData attribute)
+        /// <summary>
+        /// Set when data attributes, <c>[GenerateGenericTest]</c> or <c>IInfersType&lt;T&gt;</c> inferred
+        /// method type arguments that break the method's generic constraints. The entry cannot call
+        /// the method, so each violation reports its rows as failed tests (matching reflection mode)
+        /// instead of being dropped. All violations of one concrete class share one entry.
+        /// </summary>
+        public List<MethodConstraintViolation>? MethodConstraintViolations { get; init; }
+
+        public bool HasMergedRows => AdditionalArgumentsAttributes is not null || AdditionalClassArgumentsAttributes is not null;
+
+        /// <summary>
+        /// Set when only method-level [Arguments] rows inferred this instantiation's class type arguments,
+        /// although the class has class-level [Arguments] rows and none of them infers these types. No class
+        /// row supplies the constructor arguments, so the entry's tests fail with
+        /// <see cref="NoClassRowForMethodRowMessage"/> instead of running on an instance built from the
+        /// method row's values (#7118).
+        /// </summary>
+        public bool HasNoClassRow { get; set; }
+
+        /// <summary>
+        /// True when at least one method-level row is scoped to this instantiation.
+        /// </summary>
+        public bool HasMethodRows => (SpecificArgumentsAttribute is not null && !SpecificIsClassRow) || AdditionalArgumentsAttributes is not null;
+
+        /// <summary>
+        /// True when at least one class-level row is scoped to this instantiation.
+        /// </summary>
+        public bool HasClassRows => (SpecificArgumentsAttribute is not null && SpecificIsClassRow) || AdditionalClassArgumentsAttributes is not null;
+
+        public bool IsSpecificMethodDataSource(AttributeData attribute) =>
+            SpecificArgumentsAttribute is not null
+            && ((!SpecificIsClassRow && AreSameAttribute(attribute, SpecificArgumentsAttribute))
+                || ContainsSameAttribute(AdditionalArgumentsAttributes, attribute));
+
+        public bool IsSpecificClassDataSource(AttributeData attribute) =>
+            SpecificArgumentsAttribute is not null
+            && ((SpecificIsClassRow && AreSameAttribute(attribute, SpecificArgumentsAttribute))
+                || ContainsSameAttribute(AdditionalClassArgumentsAttributes, attribute));
+
+        /// <summary>
+        /// Records a row that infers this instantiation's type arguments, unless it is already scoped to it.
+        /// </summary>
+        public void AddRow(AttributeData row, bool isClassRow)
         {
-            if (SpecificArgumentsAttribute is null)
+            if (isClassRow)
+            {
+                if (!IsSpecificClassDataSource(row))
+                {
+                    (AdditionalClassArgumentsAttributes ??= []).Add(row);
+                }
+            }
+            else if (!IsSpecificMethodDataSource(row))
+            {
+                (AdditionalArgumentsAttributes ??= []).Add(row);
+            }
+        }
+
+        private static bool ContainsSameAttribute(List<AttributeData>? attributes, AttributeData attribute)
+        {
+            if (attributes is null)
             {
                 return false;
             }
 
-            if (AreSameAttribute(attribute, SpecificArgumentsAttribute))
+            foreach (var candidate in attributes)
             {
-                return true;
-            }
-
-            if (AdditionalArgumentsAttributes is { } additional)
-            {
-                foreach (var additionalAttribute in additional)
+                if (AreSameAttribute(attribute, candidate))
                 {
-                    if (AreSameAttribute(attribute, additionalAttribute))
-                    {
-                        return true;
-                    }
+                    return true;
                 }
             }
 
@@ -685,35 +794,94 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
     }
 
     /// <summary>
+    /// Method type arguments that break the method's generic constraints, and the rows that inferred them.
+    /// </summary>
+    /// <param name="Message">The constraint failure, worded as in reflection mode.</param>
+    /// <param name="RowSource">The data attribute whose rows inferred the type arguments, if any.</param>
+    /// <param name="AllMethodDataSources">The type arguments came from the method's parameters
+    /// (<c>IInfersType&lt;T&gt;</c>), so every method data source's rows report the failure.</param>
+    private sealed record MethodConstraintViolation(string Message, AttributeData? RowSource, bool AllMethodDataSources);
+
+    /// <summary>
+    /// Where the class type arguments of a constraint violation came from. The order matches the
+    /// order in which reflection mode discovers them, so both modes report the failures in the same
+    /// order (and so with the same test ids).
+    /// </summary>
+    private enum ClassViolationSource
+    {
+        GenerateGenericTest = 0,
+        ClassArguments = 1,
+        MethodArguments = 2,
+    }
+
+    /// <summary>
     /// Collects all concrete type instantiations for this generic test method.
     /// </summary>
-    private static List<ConcreteInstantiation> CollectConcreteInstantiations(TestMethodMetadata testMethod, string className)
+    private static List<ConcreteInstantiation> CollectConcreteInstantiations(TestMethodMetadata testMethod, string className, out List<string> classConstraintViolations)
     {
         var compilation = testMethod.CompilationContext.Compilation;
         var methodName = testMethod.MethodSymbol.Name;
         var results = new List<ConcreteInstantiation>();
         var processedTypeCombinations = new HashSet<string>();
 
-        // Instantiations built from a method-level [Arguments] row, keyed by type combination, so
-        // later rows inferring the same types join that instantiation rather than being dropped.
-        Dictionary<string, ConcreteInstantiation>? methodArgumentsInstantiations = null;
+        // Class type arguments that break the class's constraints, one per row or type (#7107).
+        var classViolations = new List<(ClassViolationSource Source, int Order, string Message)>();
+        var reportedClassViolations = new HashSet<string>();
+
+        // Instantiations built from a specific data source row, keyed by type combination, so later
+        // class or method [Arguments] rows inferring the same types join that instantiation rather
+        // than being dropped (#7096, #7106).
+        Dictionary<string, ConcreteInstantiation>? rowInstantiations = null;
+
+        // Method data sources of a generic class's non-generic method that infer none of the class's
+        // type arguments, such as [Arguments(null)]. They join a method-row instantiation that a
+        // [GenerateGenericTest] also lists, since that attribute alone would run every row on it, and
+        // every instantiation a class row establishes, since reflection mode runs them there too.
+        List<AttributeData>? uninferredMethodDataSources = null;
+
+        // Method data sources whose declared types break the method's constraints while a method-level
+        // [GenerateGenericTest] supplies the type arguments. Their rows run on the attribute's types, also
+        // when another data source already created that instantiation (#7116).
+        List<AttributeData>? deferredDataSources = null;
+
+        // A generic method on a non-generic class without [GenerateGenericTest]: every method data source
+        // that infers an existing instantiation's types joins it (#7163). With [GenerateGenericTest], a later
+        // non-[Arguments] source inferring the same types is dropped, as reflection mode does (#7092).
+        var joinsDuplicateMethodSources = testMethod is { IsGenericMethod: true, IsGenericType: false }
+            && !testMethod.MethodAttributes.Any(static a => a.AttributeClass?.IsOrInherits("global::TUnit.Core.GenerateGenericTestAttribute") is true);
 
         var classTypeArgCount = testMethod.IsGenericType ? testMethod.TypeSymbol.TypeParameters.Length : 0;
         var methodTypeArgCount = testMethod.IsGenericMethod ? testMethod.MethodSymbol.TypeParameters.Length : 0;
 
-        void TryAddInstantiation(ITypeSymbol[] typeArguments, AttributeData? specificAttr = null, bool isMethodArgumentsRow = false)
+        // specificAttr: the row that infers these types (isClassRow says whether it is a class-level
+        // [Arguments] row). methodRow: a method-level [Arguments] row paired with a class row when
+        // a generic class and a generic method are both inferred from rows. Rows that infer the same
+        // valid type arguments share one instantiation, and each still runs (#7096, #7106).
+        // reportMethodConstraintViolation: the type arguments were inferred from method-level data,
+        // [GenerateGenericTest] or IInfersType<T>. If they break the method's constraints, emit an
+        // entry that fails with the same message as reflection mode instead of silently dropping the
+        // row (#7097, #7107).
+        // reportClassViolationAs: likewise for class type arguments that break the class's
+        // constraints; violationSource identifies the row or type, so each one is reported once.
+        void TryAddInstantiation(
+            ITypeSymbol[] typeArguments,
+            AttributeData? specificAttr = null,
+            bool reportMethodConstraintViolation = false,
+            ClassViolationSource? reportClassViolationAs = null,
+            AttributeData? violationSource = null,
+            bool isClassRow = false,
+            AttributeData? methodRow = null,
+            bool fromGenerateGenericTest = false,
+            bool deferToGenerateGenericTest = false,
+            AttributeData? methodViolationRowSource = null,
+            bool methodViolationAllMethodDataSources = false)
         {
-            var typeKey = BuildTypeKey(typeArguments);
-            if (!processedTypeCombinations.Add(typeKey))
+            // A generic method of a generic class needs both the class and the method type arguments.
+            // A source that supplies only one of them (a method row or [GenerateGenericTest] without a
+            // class source) would emit an entry that names the open type parameters, which does not
+            // compile (#7117). Those sources are paired with each class source further down instead.
+            if (classTypeArgCount > 0 && methodTypeArgCount > 0 && typeArguments.Length != classTypeArgCount + methodTypeArgCount)
             {
-                if (isMethodArgumentsRow
-                    && specificAttr is not null
-                    && methodArgumentsInstantiations is not null
-                    && methodArgumentsInstantiations.TryGetValue(typeKey, out var existing))
-                {
-                    (existing.AdditionalArgumentsAttributes ??= []).Add(specificAttr);
-                }
-
                 return;
             }
 
@@ -721,12 +889,109 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             var methodTypeArgs = methodTypeArgCount > 0 ? typeArguments.Skip(classTypeArgCount).ToArray() : Array.Empty<ITypeSymbol>();
 
             // Validate constraints
-            if (classTypeArgs.Length > 0 && !ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypeArgs))
+            if (classTypeArgs.Length > 0 && !ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypeArgs, testMethod.CompilationContext.Compilation))
             {
+                // A TestEntry cannot be emitted for a closed type that breaks its own constraints, so
+                // the violation is emitted against the open generic type instead.
+                if (reportClassViolationAs is { } classViolationSource
+                    && (violationSource ?? specificAttr) is { } source
+                    && reportedClassViolations.Add(((int)classViolationSource).ToString(CultureInfo.InvariantCulture) + "|" + GetAttributeKey(source)))
+                {
+                    classViolations.Add((classViolationSource, classViolations.Count, DescribeConstraintViolation(
+                        testMethod.TypeSymbol.TypeParameters, classTypeArgs, $"type '{testMethod.TypeSymbol.MetadataName}'", testMethod.CompilationContext.Compilation)));
+                }
+
                 return;
             }
-            if (methodTypeArgs.Length > 0 && !ValidateTypeConstraints(testMethod.MethodSymbol, methodTypeArgs))
+
+            string? methodConstraintViolation = null;
+            // Method constraints may name class type parameters (`where U : IEnumerable<T>`), so they
+            // are checked with this instantiation's class type arguments substituted in.
+            if (methodTypeArgs.Length > 0 && !ValidateTypeConstraints(testMethod.MethodSymbol, methodTypeArgs, testMethod.CompilationContext.Compilation, testMethod.TypeSymbol, classTypeArgs))
             {
+                if (!reportMethodConstraintViolation || methodTypeArgs.Length != testMethod.MethodSymbol.TypeParameters.Length)
+                {
+                    if (deferToGenerateGenericTest && specificAttr is not null)
+                    {
+                        (deferredDataSources ??= []).Add(specificAttr);
+                    }
+
+                    return;
+                }
+
+                methodConstraintViolation = DescribeMethodConstraintViolation(testMethod.MethodSymbol, methodTypeArgs, testMethod.CompilationContext.Compilation, testMethod.TypeSymbol, classTypeArgs);
+
+                // Inferred from the declared type of a [MethodDataSource] member or a typed data source
+                // (DataSourceGeneratorAttribute<T> and similar), which a value of a more derived run-time
+                // type could satisfy: explain where the type argument came from (#7116).
+                if (violationSource is null
+                    && specificAttr?.AttributeClass is { } dataSourceClass
+                    && (dataSourceClass.Name == "MethodDataSourceAttribute" || DataSourceAttributeHelper.IsTypedDataSourceAttribute(dataSourceClass))
+                    && TryFindConstraintViolation(testMethod.MethodSymbol.TypeParameters, methodTypeArgs, testMethod.CompilationContext.Compilation,
+                        out _, out var violatingIndex, testMethod.TypeSymbol, classTypeArgs)
+                    && violatingIndex >= 0
+                    && !ExactTypeExtensions.IsExactType(methodTypeArgs[violatingIndex]))
+                {
+                    methodConstraintViolation += DescribeDeclaredTypeInference(testMethod.MethodSymbol.TypeParameters[violatingIndex], methodTypeArgs[violatingIndex]);
+                }
+            }
+
+            var typeKey = BuildTypeKey(typeArguments);
+            if (methodConstraintViolation != null)
+            {
+                // Each invalid row source is reported once, even when it infers the same types as another.
+                var rowSource = violationSource ?? specificAttr;
+                typeKey = $"{typeKey}|{(rowSource is null ? "*" : GetAttributeKey(rowSource))}";
+            }
+
+            if (!processedTypeCombinations.Add(typeKey))
+            {
+                if (methodConstraintViolation == null
+                    && rowInstantiations is not null
+                    && rowInstantiations.TryGetValue(typeKey, out var existing))
+                {
+                    if (fromGenerateGenericTest && uninferredMethodDataSources is not null && existing.HasMethodRows)
+                    {
+                        foreach (var uninferred in uninferredMethodDataSources)
+                        {
+                            existing.AddRow(uninferred, isClassRow: false);
+                        }
+                    }
+
+                    // The class rows' instantiation of a class-level [GenerateGenericTest]'s types stands for both,
+                    // so it also reads the own-class [MethodDataSource] members that only [GenerateGenericTest]
+                    // supplies the types of, and those whose declared rows infer these types, whether or not the
+                    // method has rows. AddRow skips a source a repeated attribute already added. Reflection mode
+                    // does the same in AddDeferredOwnSources and GroupClassRowsByTypeArgumentsAsync (#7208).
+                    if (fromGenerateGenericTest && existing.HasClassRows)
+                    {
+                        foreach (var ownSource in GetOwnClassMethodDataSourcesForInstantiation(testMethod, classTypeArgs))
+                        {
+                            existing.AddRow(ownSource, isClassRow: true);
+                        }
+                    }
+
+                    // A generic method on a non-generic class runs only the sources scoped to its
+                    // instantiation, so any method data source that infers the same types as an earlier
+                    // one (a second [MethodDataSource] declared like the first, say) joins it too.
+                    // Otherwise its rows would be reported as uninferable (#7163). Reflection mode drops
+                    // such a source when the method has [GenerateGenericTest], so it is dropped here too.
+                    // The name also matches [Arguments<T>], a literal row that joins as well (#7214).
+                    if (specificAttr?.AttributeClass?.Name == "ArgumentsAttribute"
+                        || (specificAttr is not null && !isClassRow && joinsDuplicateMethodSources))
+                    {
+                        existing.AddRow(specificAttr, isClassRow);
+                    }
+
+                    // Only a method [Arguments] row joins. Any other method source (a typed source or
+                    // [MethodDataSource]) inferring types an earlier source instantiated is dropped, as on a
+                    // non-generic class and in reflection mode's AddInstantiation.
+                    if (methodRow?.AttributeClass?.Name == "ArgumentsAttribute")
+                    {
+                        existing.AddRow(methodRow, isClassRow: false);
+                    }
+                }
+
                 return;
             }
 
@@ -742,9 +1007,30 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 concreteClassName = className;
             }
 
-            // Build test name
+            MethodConstraintViolation? violation = null;
+            if (methodConstraintViolation != null)
+            {
+                violation = new MethodConstraintViolation(
+                    methodConstraintViolation,
+                    // [GenerateGenericTest] (the violation source) has no rows: it reports one failure.
+                    // A method data source paired with a class row reports each of its own rows
+                    // (methodViolationRowSource), and IInfersType<T> each row of every method data source.
+                    RowSource: methodViolationRowSource ?? (violationSource is null ? specificAttr : null),
+                    AllMethodDataSources: methodViolationAllMethodDataSources || (specificAttr is null && violationSource is null));
+
+                // All violations of one concrete class share one entry, so that each failing row gets
+                // its own data source index, and so its own test id.
+                var existing = results.FirstOrDefault(r => r.MethodConstraintViolations != null && r.ConcreteClassName == concreteClassName);
+                if (existing != null)
+                {
+                    existing.MethodConstraintViolations!.Add(violation);
+                    return;
+                }
+            }
+
+            // Build test name. A violation entry is named after the method alone, as in reflection mode.
             string testName;
-            if (methodTypeArgs.Length > 0)
+            if (methodTypeArgs.Length > 0 && violation == null)
             {
                 testName = $"{methodName}<{string.Join(", ", methodTypeArgs.Select(t => t.ToTestNameTypeArgument()))}>";
             }
@@ -776,14 +1062,94 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 TestName = testName,
                 MethodName = methodName,
                 SpecificArgumentsAttribute = specificAttr,
+                SpecificIsClassRow = specificAttr is not null && isClassRow,
                 HasParameterizedConstructor = hasParameterizedConstructor,
+                MethodConstraintViolations = violation == null ? null : [violation],
             };
 
             results.Add(instantiation);
 
-            if (isMethodArgumentsRow && specificAttr is not null)
+            if (violation == null && specificAttr is not null)
             {
-                (methodArgumentsInstantiations ??= new Dictionary<string, ConcreteInstantiation>())[typeKey] = instantiation;
+                if (methodRow is not null)
+                {
+                    instantiation.AddRow(methodRow, isClassRow: false);
+                }
+
+                (rowInstantiations ??= new Dictionary<string, ConcreteInstantiation>())[typeKey] = instantiation;
+            }
+        }
+
+        // A class row combined with a generic method row. A class violation is reported once per
+        // class row; a method violation once per method row, as reflection mode reports it when
+        // the row's inferred method type arguments fail to resolve.
+        // A method data source other than an [Arguments] row (such as [MethodDataSource]) may yield
+        // several rows, so a method violation is reported once per row it yields instead.
+        void TryAddCombinedArgumentsInstantiation(ITypeSymbol[] classTypes, ITypeSymbol[] combinedTypes, AttributeData classAttr, AttributeData methodAttr)
+        {
+            TryAddInstantiation(combinedTypes, classAttr,
+                reportMethodConstraintViolation: true,
+                reportClassViolationAs: ClassViolationSource.ClassArguments,
+                violationSource: ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypes, compilation) ? methodAttr : classAttr,
+                isClassRow: true,
+                methodRow: methodAttr,
+                methodViolationRowSource: methodAttr.AttributeClass?.Name == "ArgumentsAttribute" ? null : methodAttr);
+        }
+
+        // A class row paired with method type arguments that no single method data source inferred:
+        // a method [GenerateGenericTest] type (methodSource) or IInfersType<T> (null). The class row
+        // scopes the entry to itself, and every method data source runs on it, as on a non-generic
+        // class (#7117).
+        void TryAddClassRowInstantiationWithEveryMethodSource(ITypeSymbol[] classTypes, ITypeSymbol[] combinedTypes, AttributeData classAttr, AttributeData? methodSource, List<AttributeData>? methodDataSources)
+        {
+            var countBefore = results.Count;
+            TryAddInstantiation(combinedTypes, classAttr,
+                reportMethodConstraintViolation: true,
+                reportClassViolationAs: ClassViolationSource.ClassArguments,
+                violationSource: methodSource is not null && ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypes, compilation) ? methodSource : classAttr,
+                isClassRow: true,
+                methodViolationAllMethodDataSources: methodSource is null);
+
+            if (results.Count > countBefore
+                && results[results.Count - 1] is { MethodConstraintViolations: null } added
+                && methodDataSources is not null)
+            {
+                foreach (var dataSource in methodDataSources)
+                {
+                    added.AddRow(dataSource, isClassRow: false);
+                }
+            }
+        }
+
+        // The class and method type arguments of a generic method of a generic class. A method type
+        // argument inferred from a member of the open class (a [MethodDataSource] returning
+        // IEnumerable<Func<(T, int)>>) may name a class type parameter, which is replaced by this class
+        // type argument, as reflection mode reads the member on the closed class (#7117).
+        ITypeSymbol[] CloseOverClass(ITypeSymbol[] classTypes, ITypeSymbol[] methodTypes)
+        {
+            var combined = new ITypeSymbol[classTypes.Length + methodTypes.Length];
+            Array.Copy(classTypes, combined, classTypes.Length);
+            for (var i = 0; i < methodTypes.Length; i++)
+            {
+                combined[classTypes.Length + i] = SubstituteTypeParameters(methodTypes[i], testMethod.TypeSymbol.TypeParameters, classTypes, compilation);
+            }
+
+            return combined;
+        }
+
+        // A [GenerateGenericTest] instantiation that another data source already created runs only that
+        // source's rows, so the deferred sources' rows join it rather than being dropped. Reflection mode
+        // does the same in InferMethodInstantiationsFromDataSources (#7116).
+        void JoinDeferredDataSources(ITypeSymbol[] typeArguments)
+        {
+            if (deferredDataSources is not null
+                && rowInstantiations is not null
+                && rowInstantiations.TryGetValue(BuildTypeKey(typeArguments), out var existing))
+            {
+                foreach (var deferred in deferredDataSources)
+                {
+                    existing.AddRow(deferred, isClassRow: false);
+                }
             }
         }
 
@@ -850,7 +1216,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                     var combinedTypes = new ITypeSymbol[classTypes.Length + methodTypes.Length];
                     Array.Copy(classTypes, 0, combinedTypes, 0, classTypes.Length);
                     Array.Copy(methodTypes, 0, combinedTypes, classTypes.Length, methodTypes.Length);
-                    TryAddInstantiation(combinedTypes, classAttr);
+                    TryAddCombinedArgumentsInstantiation(classTypes, combinedTypes, classAttr, methodAttr);
                 }
             }
         }
@@ -867,7 +1233,8 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             foreach (var argAttr in allArgumentsAttributes)
             {
                 ITypeSymbol[]? inferredTypes;
-                if (testMethod.IsGenericType && classArgumentsAttributes.Contains(argAttr))
+                var isClassArgumentsAttribute = testMethod.IsGenericType && classArgumentsAttributes.Contains(argAttr);
+                if (isClassArgumentsAttribute)
                 {
                     inferredTypes = InferTypesFromClassArgumentsAttribute(testMethod.TypeSymbol, argAttr, compilation);
                 }
@@ -877,26 +1244,62 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 }
                 if (inferredTypes is { Length: > 0 })
                 {
-                    // Method rows on a generic method in a non-generic class: several rows may infer
-                    // the same T (e.g. [Arguments(1)] [Arguments(2)]) and each must still run.
+                    // Several rows may infer the same types (e.g. [Arguments(1)] [Arguments(2)]) and
+                    // each must still run, so later rows join the first row's instantiation.
                     TryAddInstantiation(inferredTypes, argAttr,
-                        isMethodArgumentsRow: testMethod is { IsGenericType: false, IsGenericMethod: true });
+                        reportMethodConstraintViolation: !isClassArgumentsAttribute,
+                        reportClassViolationAs: isClassArgumentsAttribute ? ClassViolationSource.ClassArguments : null,
+                        isClassRow: isClassArgumentsAttribute);
                 }
             }
         }
 
+        // Method-level [Arguments] rows of a non-generic method that infer the generic class's type arguments
+        List<AttributeData>? inferringRows = null;
+
         // Handle generic classes with non-generic methods that have method-level Arguments
         if (testMethod is { IsGenericType: true, IsGenericMethod: false } && methodArgumentsAttributes.Count > 0)
         {
+            // When [GenerateGenericTest] or a class-level data source already supplies the class type
+            // arguments, a method row's values need not infer them: [GenerateGenericTest(typeof(object))]
+            // with [Arguments(1)] runs C<object>, so the C<int> inferred here is not reported as a
+            // violation. Reflection mode applies the same rule.
+            var classTypeArgumentsSupplied = testMethod.TypeSymbol.GetAttributes().Any(a =>
+                a.AttributeClass is { } attributeClass
+                && (attributeClass.IsOrInherits("global::TUnit.Core.GenerateGenericTestAttribute")
+                    || DataSourceAttributeHelper.IsDataSourceAttribute(attributeClass)));
+
             foreach (var methodArgAttr in methodArgumentsAttributes)
             {
-                var inferredTypes = InferClassTypesFromMethodArguments(testMethod.TypeSymbol, testMethod.MethodSymbol, methodArgAttr, compilation);
+                var inferredTypes = InferClassTypesFromMethodArguments(testMethod.TypeSymbol, testMethod.MethodSymbol, methodArgAttr, compilation,
+                    nullArgumentsArrayInfersObject: !classTypeArgumentsSupplied);
                 if (inferredTypes is { Length: > 0 })
                 {
-                    TryAddInstantiation(inferredTypes, methodArgAttr);
+                    (inferringRows ??= []).Add(methodArgAttr);
+                    TryAddInstantiation(inferredTypes, methodArgAttr,
+                        reportClassViolationAs: classTypeArgumentsSupplied ? null : ClassViolationSource.MethodArguments);
+                }
+            }
+
+            foreach (var dataSourceAttr in typedDataSourceBucket ?? Enumerable.Empty<AttributeData>())
+            {
+                if (inferringRows is null || !inferringRows.Contains(dataSourceAttr))
+                {
+                    (uninferredMethodDataSources ??= []).Add(dataSourceAttr);
                 }
             }
         }
+
+        // With a method-level [GenerateGenericTest], a data source whose declared type breaks the method's
+        // constraints is not reported: its rows run on the attribute's type arguments instead, which is how
+        // a data source declared with a broad type (object, an interface or int?) supplies more specific
+        // values. Reflection mode skips such sources the same way (InferMethodInstantiationsFromDataSources
+        // in TUnit.Engine), and TUnit0001 accepts them (#7116).
+        // Only a [GenerateGenericTest] with a full set of type arguments can run those rows: an empty or
+        // wrongly sized one creates no instantiation, so the rows would silently disappear.
+        var reportDataSourceConstraintViolations = !(testMethod.IsGenericMethod
+            && generateGenericTestBucket is not null
+            && generateGenericTestBucket.Any(a => ExtractTypeArgsFromGenerateGenericTestAttribute(a)?.Length == methodTypeArgCount));
 
         // Process typed data source attributes
         foreach (var dataSourceAttr in typedDataSourceBucket ?? Enumerable.Empty<AttributeData>())
@@ -904,7 +1307,8 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             var inferredTypes = InferTypesFromDataSourceAttribute(testMethod.MethodSymbol, dataSourceAttr);
             if (inferredTypes is { Length: > 0 })
             {
-                TryAddInstantiation(inferredTypes, dataSourceAttr);
+                TryAddInstantiation(inferredTypes, dataSourceAttr, reportMethodConstraintViolation: reportDataSourceConstraintViolations,
+                    deferToGenerateGenericTest: !reportDataSourceConstraintViolations);
             }
         }
 
@@ -914,7 +1318,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             var inferredTypes = InferTypesFromTypeInferringAttributes(testMethod.MethodSymbol);
             if (inferredTypes is { Length: > 0 })
             {
-                TryAddInstantiation(inferredTypes);
+                TryAddInstantiation(inferredTypes, reportMethodConstraintViolation: true);
             }
         }
 
@@ -946,7 +1350,8 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 var inferredTypes = InferTypesFromMethodDataSource(testMethod, mdsAttr);
                 if (inferredTypes is { Length: > 0 })
                 {
-                    TryAddInstantiation(inferredTypes, mdsAttr);
+                    TryAddInstantiation(inferredTypes, mdsAttr, reportMethodConstraintViolation: reportDataSourceConstraintViolations,
+                        deferToGenerateGenericTest: !reportDataSourceConstraintViolations);
                 }
             }
         }
@@ -966,13 +1371,13 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                             var methodInferredTypes = InferTypesFromArgumentsAttribute(testMethod.MethodSymbol, methodArgAttr, compilation);
                             if (methodInferredTypes is { Length: > 0 })
                             {
-                                TryAddInstantiation(classInferredTypes.Concat(methodInferredTypes).ToArray(), argAttr);
+                                TryAddCombinedArgumentsInstantiation(classInferredTypes, classInferredTypes.Concat(methodInferredTypes).ToArray(), argAttr, methodArgAttr);
                             }
                         }
                     }
                     else
                     {
-                        TryAddInstantiation(classInferredTypes, argAttr);
+                        TryAddInstantiation(classInferredTypes, argAttr, reportClassViolationAs: ClassViolationSource.ClassArguments, isClassRow: true);
                     }
                 }
             }
@@ -983,55 +1388,426 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         {
             var methodGenericTestAttrs = testMethod.IsGenericMethod && generateGenericTestBucket is not null
                 ? generateGenericTestBucket
-                    .Select(ExtractTypeArgsFromGenerateGenericTestAttribute)
-                    .Where(t => t is { Length: > 0 })
+                    .Select(a => (Attribute: a, TypeArgs: ExtractTypeArgsFromGenerateGenericTestAttribute(a)))
+                    .Where(t => t.TypeArgs is { Length: > 0 })
                     .ToList()
-                : new List<ITypeSymbol[]?>();
+                : [];
 
             var classGenericTestAttrs = testMethod.IsGenericType
                 ? testMethod.TypeSymbol.GetAttributes()
                     .Where(a => a.AttributeClass?.IsOrInherits("global::TUnit.Core.GenerateGenericTestAttribute") is true)
-                    .Select(ExtractTypeArgsFromGenerateGenericTestAttribute)
-                    .Where(t => t is { Length: > 0 })
+                    .Select(a => (Attribute: a, TypeArgs: ExtractTypeArgsFromGenerateGenericTestAttribute(a)))
+                    .Where(t => t.TypeArgs is { Length: > 0 })
                     .ToList()
-                : new List<ITypeSymbol[]?>();
+                : [];
 
-            if (testMethod is { IsGenericType: true, IsGenericMethod: true } && classGenericTestAttrs.Count > 0 && methodGenericTestAttrs.Count > 0)
+            if (testMethod is { IsGenericType: true, IsGenericMethod: true })
             {
-                // Cartesian product of class and method type args
-                foreach (var classTypeArgs in classGenericTestAttrs)
+                // A generic method of a generic class pairs every class source with every method
+                // source (#7117), as reflection mode closes the method on each concrete class. Method
+                // data sources come first, in reflection mode's order, so a type that one of them
+                // infers runs only that source. Any other [GenerateGenericTest] type runs every method
+                // data source. A null source (IInfersType<T>) also runs every method data source.
+                var methodSources = new List<(ITypeSymbol[] Types, AttributeData? Source)>();
+                foreach (var methodArgAttr in methodArgumentsAttributes)
                 {
-                    foreach (var methodTypeArgs in methodGenericTestAttrs)
+                    if (InferTypesFromArgumentsAttribute(testMethod.MethodSymbol, methodArgAttr, compilation) is { } types && types.Length == methodTypeArgCount)
                     {
-                        if (classTypeArgs != null && methodTypeArgs != null)
+                        methodSources.Add((types, methodArgAttr));
+                    }
+                }
+
+                // A typed data source (DataSourceGeneratorAttribute<T>) infers the method type arguments
+                // as on a non-generic class (#7164). One whose type arguments cover the class type
+                // parameters as well is not a method source: it closes the class and the method itself.
+                foreach (var dataSourceAttr in typedDataSourceBucket ?? Enumerable.Empty<AttributeData>())
+                {
+                    if (InferTypesFromDataSourceAttribute(testMethod.MethodSymbol, dataSourceAttr) is { } types && types.Length == methodTypeArgCount)
+                    {
+                        methodSources.Add((types, dataSourceAttr));
+                    }
+                }
+
+                if (InferTypesFromTypeInferringAttributes(testMethod.MethodSymbol) is { } inferringTypes && inferringTypes.Length == methodTypeArgCount)
+                {
+                    methodSources.Add((inferringTypes, null));
+                }
+
+                foreach (var mdsAttr in methodDataSourceBucket ?? Enumerable.Empty<AttributeData>())
+                {
+                    if (InferTypesFromMethodDataSource(testMethod, mdsAttr) is { } types && types.Length == methodTypeArgCount)
+                    {
+                        methodSources.Add((types, mdsAttr));
+                    }
+                }
+
+                foreach (var classGenericTest in classGenericTestAttrs)
+                {
+                    var classIsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, classGenericTest.TypeArgs!, compilation);
+                    foreach (var (methodTypes, source) in methodSources)
+                    {
+                        TryAddInstantiation(CloseOverClass(classGenericTest.TypeArgs!, methodTypes), source,
+                            reportMethodConstraintViolation: true,
+                            reportClassViolationAs: ClassViolationSource.GenerateGenericTest,
+                            violationSource: classIsValid ? null : classGenericTest.Attribute);
+                    }
+                }
+
+                foreach (var classAttr in classArgumentsAttributes)
+                {
+                    var classTypes = InferTypesFromClassArgumentsAttribute(testMethod.TypeSymbol, classAttr, compilation);
+                    if (classTypes is not { Length: > 0 })
+                    {
+                        continue;
+                    }
+
+                    // Method rows were already paired with this class row above; they join their entries.
+                    foreach (var (methodTypes, source) in methodSources)
+                    {
+                        if (source is not null)
                         {
-                            var combined = classTypeArgs.Concat(methodTypeArgs).ToArray();
-                            TryAddInstantiation(combined);
+                            TryAddCombinedArgumentsInstantiation(classTypes, CloseOverClass(classTypes, methodTypes), classAttr, source);
                         }
+                        else
+                        {
+                            TryAddClassRowInstantiationWithEveryMethodSource(classTypes, CloseOverClass(classTypes, methodTypes), classAttr, methodSource: null, typedDataSourceBucket);
+                        }
+                    }
+
+                    foreach (var methodGenericTest in methodGenericTestAttrs)
+                    {
+                        TryAddClassRowInstantiationWithEveryMethodSource(classTypes, classTypes.Concat(methodGenericTest.TypeArgs!).ToArray(), classAttr, methodGenericTest.Attribute, typedDataSourceBucket);
+                    }
+                }
+
+                // Cartesian product of class and method type args
+                foreach (var classGenericTest in classGenericTestAttrs)
+                {
+                    foreach (var methodGenericTest in methodGenericTestAttrs)
+                    {
+                        var combined = classGenericTest.TypeArgs!.Concat(methodGenericTest.TypeArgs!).ToArray();
+                        JoinDeferredDataSources(combined);
+                        TryAddInstantiation(combined,
+                            reportMethodConstraintViolation: true,
+                            reportClassViolationAs: ClassViolationSource.GenerateGenericTest,
+                            violationSource: ValidateClassTypeConstraints(testMethod.TypeSymbol, classGenericTest.TypeArgs!, testMethod.CompilationContext.Compilation)
+                                ? methodGenericTest.Attribute
+                                : classGenericTest.Attribute);
                     }
                 }
             }
             else
             {
                 // Only class or only method
-                foreach (var typeArgs in classGenericTestAttrs)
+                foreach (var classGenericTest in classGenericTestAttrs)
                 {
-                    if (typeArgs != null)
-                    {
-                        TryAddInstantiation(typeArgs);
-                    }
+                    TryAddInstantiation(classGenericTest.TypeArgs!,
+                        reportClassViolationAs: ClassViolationSource.GenerateGenericTest,
+                        violationSource: classGenericTest.Attribute,
+                        fromGenerateGenericTest: true);
                 }
-                foreach (var typeArgs in methodGenericTestAttrs)
+                foreach (var methodGenericTest in methodGenericTestAttrs)
                 {
-                    if (typeArgs != null)
+                    JoinDeferredDataSources(methodGenericTest.TypeArgs!);
+                    TryAddInstantiation(methodGenericTest.TypeArgs!,
+                        reportMethodConstraintViolation: true,
+                        violationSource: methodGenericTest.Attribute);
+                }
+            }
+        }
+
+        // A class row fixes the instantiation's types on its own, so an own-class [MethodDataSource] member whose
+        // declared rows infer the same types supplies further class rows for it, with or without [GenerateGenericTest],
+        // as reflection mode groups those rows with the class [Arguments] rows (#7208). A member whose rows infer no
+        // types needs [GenerateGenericTest] to close the class it is read on, so only that path adds it.
+        if (testMethod.IsGenericType && rowInstantiations is not null)
+        {
+            foreach (var instantiation in rowInstantiations.Values)
+            {
+                if (instantiation.HasClassRows)
+                {
+                    foreach (var ownSource in GetOwnClassMethodDataSourcesForInstantiation(testMethod, instantiation.ClassTypeArgs, includeUninferred: false))
                     {
-                        TryAddInstantiation(typeArgs);
+                        instantiation.AddRow(ownSource, isClassRow: true);
                     }
                 }
             }
         }
 
+        // A class row fixes the instantiation's types on its own, so method rows that infer no type
+        // apply to it as they do to any other test of that class. Without them, a method whose
+        // parameters use the class's type arguments would get no method data source at all.
+        if (uninferredMethodDataSources is not null && rowInstantiations is not null && MethodParametersReferenceTypeParameters(testMethod))
+        {
+            foreach (var instantiation in rowInstantiations.Values)
+            {
+                if (instantiation.HasClassRows)
+                {
+                    foreach (var uninferred in uninferredMethodDataSources)
+                    {
+                        instantiation.AddRow(uninferred, isClassRow: false);
+                    }
+                }
+            }
+        }
+
+        // A method row runs only on the class instantiation its values infer, and reflection mode applies the
+        // same rules (#7118). When the class has class-level [Arguments] rows:
+        // - an instantiation that only method rows infer has no class row to supply its constructor
+        //   arguments, so its tests fail rather than run with the method row's values as constructor
+        //   arguments. A class-level [GenerateGenericTest] listing the same types still supplies them.
+        // - an instantiation that only class rows infer, of a method whose rows all infer other types,
+        //   has no method row to run, so it yields no test instead of one called without arguments.
+        if (testMethod is { IsGenericType: true, IsGenericMethod: false }
+            && classArgumentsAttributes.Length > 0
+            && inferringRows is not null
+            && rowInstantiations is not null)
+        {
+            List<ITypeSymbol[]>? generateGenericTestTypes = null;
+            foreach (var attribute in testMethod.TypeSymbol.GetAttributes())
+            {
+                if (attribute.AttributeClass?.IsOrInherits("global::TUnit.Core.GenerateGenericTestAttribute") is true
+                    && ExtractTypeArgsFromGenerateGenericTestAttribute(attribute) is { Length: > 0 } typeArgs)
+                {
+                    (generateGenericTestTypes ??= []).Add(typeArgs);
+                }
+            }
+
+            // Class-level data sources other than [Arguments] rows. Reflection mode groups their rows by the
+            // types of their values, so one whose rows have this instantiation's class type arguments supplies
+            // its constructor arguments. The generator reads those types from a typed source's declared type
+            // arguments. It cannot see the row types of any other source, so such a source is kept as well.
+            List<(AttributeData Attribute, ITypeSymbol[]? ClassTypes)>? otherClassDataSources = null;
+            foreach (var attribute in testMethod.TypeSymbol.GetAttributes())
+            {
+                if (attribute.AttributeClass is { } attributeClass
+                    && attributeClass.Name != "ArgumentsAttribute"
+                    && DataSourceAttributeHelper.IsDataSourceAttribute(attributeClass))
+                {
+                    (otherClassDataSources ??= []).Add((attribute, InferClassTypesFromTypedClassDataSource(testMethod.TypeSymbol, attributeClass)));
+                }
+            }
+
+            var addUninferredMethodDataSources = uninferredMethodDataSources is not null && MethodParametersReferenceTypeParameters(testMethod);
+
+            foreach (var instantiation in rowInstantiations.Values)
+            {
+                if (instantiation.HasMethodRows && !instantiation.HasClassRows)
+                {
+                    var hasClassDataSource = false;
+                    foreach (var (attribute, classTypes) in otherClassDataSources ?? [])
+                    {
+                        if (classTypes is null || InferredTypesMatch(classTypes, instantiation.ClassTypeArgs))
+                        {
+                            instantiation.AddRow(attribute, isClassRow: true);
+                            hasClassDataSource = true;
+                        }
+                    }
+
+                    // The class data source makes this a class row instantiation after the pass above gave
+                    // those the method rows that infer no type, so they join it here, as in reflection mode
+                    if (hasClassDataSource && addUninferredMethodDataSources)
+                    {
+                        foreach (var uninferred in uninferredMethodDataSources!)
+                        {
+                            instantiation.AddRow(uninferred, isClassRow: false);
+                        }
+                    }
+
+                    instantiation.HasNoClassRow = !hasClassDataSource
+                        && (generateGenericTestTypes is null
+                            || !generateGenericTestTypes.Any(types => InferredTypesMatch(types, instantiation.ClassTypeArgs)));
+                }
+                else if (instantiation.HasClassRows && !instantiation.HasMethodRows)
+                {
+                    results.Remove(instantiation);
+                }
+            }
+
+            // An instantiation that no row made, inferred from the declared type of a method data source
+            // (a [MethodDataSource] returning IEnumerable<object>), has no class row either. Reflection mode
+            // infers class type arguments only from class data sources and method [Arguments] rows, so it
+            // has no such instantiation. A [GenerateGenericTest] or a class data source of those types still
+            // supplies one.
+            results.RemoveAll(instantiation =>
+                instantiation is { SpecificArgumentsAttribute: null, MethodConstraintViolations: null, ClassTypeArgs.Length: > 0 }
+                && (generateGenericTestTypes is null || !generateGenericTestTypes.Any(types => InferredTypesMatch(types, instantiation.ClassTypeArgs)))
+                && (otherClassDataSources is null || !otherClassDataSources.Any(source => source.ClassTypes is null || InferredTypesMatch(source.ClassTypes, instantiation.ClassTypeArgs))));
+        }
+
+        // Reflection mode (ReflectionGenericConstraintViolations in TUnit.Engine) reports class-level
+        // [GenerateGenericTest] types first, then class rows, then method rows; each group keeps
+        // declaration order. Keep the two in step: the order decides the failed tests' ids.
+        classConstraintViolations = classViolations
+            .OrderBy(v => v.Source)
+            .ThenBy(v => v.Order)
+            .Select(v => v.Message)
+            .ToList();
+
+        if (testMethod is { IsGenericMethod: true, IsGenericType: false })
+        {
+            AddUninferredTypeArgumentFailures(testMethod, className, results);
+        }
+
         return results;
+    }
+
+    /// <summary>
+    /// Reports the data sources of a generic test method whose rows no instantiation runs, because
+    /// their declared type does not determine the method's type arguments (an <c>object</c> or
+    /// <c>object[]</c> row, say). Reflection mode infers the type arguments from each row's run-time
+    /// values, which source-generated mode cannot do. Rather than dropping the rows silently, each of
+    /// them fails with a message that says how to fix it. A method with no data source at all fails
+    /// once, as it does in reflection mode (#7163).
+    /// </summary>
+    private static void AddUninferredTypeArgumentFailures(TestMethodMetadata testMethod, string className, List<ConcreteInstantiation> results)
+    {
+        List<AttributeData>? uncovered = null;
+        var hasDataSource = false;
+
+        foreach (var attribute in testMethod.MethodAttributes)
+        {
+            // [GenerateGenericTest] lists the type arguments, so its types run every data source
+            // (or fail their constraints) and no data source has to infer them.
+            if (attribute.AttributeClass?.IsOrInherits("global::TUnit.Core.GenerateGenericTestAttribute") is true)
+            {
+                return;
+            }
+        }
+
+        foreach (var attribute in testMethod.MethodAttributes)
+        {
+            if (!DataSourceAttributeHelper.IsDataSourceAttribute(attribute.AttributeClass))
+            {
+                continue;
+            }
+
+            hasDataSource = true;
+            if (!IsRunByAnyInstantiation(testMethod, results, attribute))
+            {
+                (uncovered ??= []).Add(attribute);
+            }
+        }
+
+        if (hasDataSource && uncovered is null)
+        {
+            return;
+        }
+
+        if (!hasDataSource && results.Count > 0)
+        {
+            return;
+        }
+
+        var methodName = testMethod.MethodSymbol.Name;
+        var violations = new List<MethodConstraintViolation>();
+        if (uncovered is null)
+        {
+            violations.Add(new MethodConstraintViolation(
+                $"Could not infer the type arguments of generic test method '{methodName}': it has no data source to infer them from. List the type arguments with [GenerateGenericTest].",
+                RowSource: null,
+                AllMethodDataSources: false));
+        }
+        else
+        {
+            foreach (var attribute in uncovered)
+            {
+                if (attribute.AttributeClass?.Name == "MethodDataSourceAttribute"
+                    && InferTypesFromMethodDataSourceRowType(testMethod, attribute) is { } rowTypes
+                    && FindInaccessibleType(rowTypes, testMethod.CompilationContext.Compilation) is { } inaccessibleType)
+                {
+                    violations.Add(new MethodConstraintViolation(
+                        $"Could not infer the type arguments of generic test method '{methodName}' from data source [{DescribeDataSource(attribute)}]. "
+                        + $"Its rows give the type argument '{inaccessibleType.ToDisplayString()}', which source-generated code cannot name because it is private or protected. "
+                        + "Make that type internal or public, or list accessible type arguments with [GenerateGenericTest].",
+                        RowSource: attribute,
+                        AllMethodDataSources: false));
+                    continue;
+                }
+
+                violations.Add(new MethodConstraintViolation(
+                    $"Could not infer the type arguments of generic test method '{methodName}' from data source [{DescribeDataSource(attribute)}]. "
+                    + "Source-generated mode infers type arguments at compile time from the data source's declared type, not from the run-time type of its values, and that declared type does not determine them. "
+                    + "Declare the data source with a type that does (for example IEnumerable<Func<int>> rather than IEnumerable<object>), or list the type arguments with [GenerateGenericTest].",
+                    RowSource: attribute,
+                    AllMethodDataSources: false));
+            }
+        }
+
+        // All failures of one concrete class share one entry, as constraint violations do, so each
+        // failing row gets its own data source index and so its own test id.
+        var existing = results.FirstOrDefault(r => r.MethodConstraintViolations != null && r.ConcreteClassName == className);
+        if (existing != null)
+        {
+            existing.MethodConstraintViolations!.AddRange(violations);
+            return;
+        }
+
+        results.Add(new ConcreteInstantiation
+        {
+            ConcreteClassName = className,
+            TypeArguments = [],
+            ClassTypeArgs = [],
+            MethodTypeArgs = [],
+            TestName = methodName,
+            MethodName = methodName,
+            MethodConstraintViolations = violations,
+        });
+
+        static string DescribeDataSource(AttributeData attribute)
+        {
+            if (attribute.ApplicationSyntaxReference?.GetSyntax() is { } syntax)
+            {
+                return syntax.ToString();
+            }
+
+            var name = attribute.AttributeClass?.Name ?? "DataSource";
+            return name.EndsWith("Attribute", StringComparison.Ordinal) ? name.Substring(0, name.Length - "Attribute".Length) : name;
+        }
+    }
+
+    /// <summary>
+    /// Whether the rows of <paramref name="dataSource"/> run, or are reported, on at least one of the
+    /// instantiations of a generic method on a non-generic class. This mirrors the data source
+    /// selection in <see cref="EmitConcreteDataSources"/>.
+    /// </summary>
+    private static bool IsRunByAnyInstantiation(TestMethodMetadata testMethod, List<ConcreteInstantiation> results, AttributeData dataSource)
+    {
+        if (results.Count == 0)
+        {
+            return false;
+        }
+
+        // When the parameters do not use the type arguments, every instantiation runs every data source.
+        if (!MethodParametersReferenceTypeParameters(testMethod))
+        {
+            return true;
+        }
+
+        foreach (var instantiation in results)
+        {
+            if (instantiation.MethodConstraintViolations is { } violations)
+            {
+                foreach (var violation in violations)
+                {
+                    if (violation.AllMethodDataSources
+                        || (violation.RowSource is { } rowSource && AreSameAttribute(rowSource, dataSource)))
+                    {
+                        return true;
+                    }
+                }
+
+                continue;
+            }
+
+            // [GenerateGenericTest] and IInfersType<T> instantiations run every method data source.
+            if (instantiation.SpecificArgumentsAttribute is null || instantiation.IsSpecificMethodDataSource(dataSource))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1074,12 +1850,50 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         {
             writer.AppendLine("throw new global::System.NotSupportedException(\"Instance creation for classes with ClassConstructor attribute is handled at runtime\");");
         }
-        else if (entry.HasParameterizedConstructor && entry.SpecificArgumentsAttribute is { ConstructorArguments.Length: > 0 } specificAttr &&
+        else if (entry.HasNoClassRow)
+        {
+            writer.AppendLine($"throw new global::System.InvalidOperationException(\"{EscapeString(NoClassRowForMethodRowMessage)}\");");
+        }
+        else if (entry.HasParameterizedConstructor && GetClassDataSourcePartition(testMethod, entry) is { } partition)
+        {
+            // Some class rows come from data sources whose row types are known only at run time, so every
+            // test's row reaches the constructor through args (#7210)
+            if (partition.Fallback == ClassRowFallback.NoClassRow)
+            {
+                // No row of any class data source inferred these types, so the partition yields one empty row
+                writer.AppendLine($"if (args.Length == 0) throw new global::System.InvalidOperationException(\"{EscapeString(NoClassRowForMethodRowMessage)}\");");
+            }
+
+            if (partition.Fallback == ClassRowFallback.AllRows || !entry.HasClassRows)
+            {
+                // Rows of other types may build the instance, converted to the parameter types (#7161)
+                writer.AppendRaw(InstanceFactoryGenerator.GenerateInstanceFactoryBody(testMethod.TypeSymbol.Construct(entry.ClassTypeArgs)));
+            }
+            else
+            {
+                writer.AppendLine($"return ({concreteClassName})global::System.Activator.CreateInstance(typeof({concreteClassName}), args)!;");
+            }
+        }
+        // Bake the row's values in only when it is the instantiation's only class row. When several
+        // class rows share it, each test's row reaches the constructor through args instead. A method
+        // row's values are never constructor arguments: an instantiation that only method rows infer
+        // takes them from the class-level data sources, as reflection mode does (#7161). Only the
+        // non-generic [Arguments(params object?[])] holds its values in an array: the array of an
+        // [Arguments<int[]>] row is the row's one value, so that row reaches the constructor through args.
+        else if (entry.HasParameterizedConstructor && entry.SpecificIsClassRow && entry.AdditionalClassArgumentsAttributes is null &&
+                 entry.SpecificArgumentsAttribute is { AttributeClass.IsGenericType: false, ConstructorArguments.Length: > 0 } specificAttr &&
                  specificAttr.ConstructorArguments[0].Kind == TypedConstantKind.Array)
         {
             var argumentValues = specificAttr.ConstructorArguments[0].Values;
             var constructorArgs = string.Join(", ", argumentValues.Select(arg => TypedConstantParser.GetRawTypedConstantValue(arg)));
             writer.AppendLine($"return ({concreteClassName})global::System.Activator.CreateInstance(typeof({concreteClassName}), new object[] {{ {constructorArgs} }})!;");
+        }
+        else if (entry.HasParameterizedConstructor && !entry.HasClassRows && entry.ClassTypeArgs.Length > 0)
+        {
+            // No class row infers these types, so the constructor arguments come from class-level data
+            // sources of any type, such as a [MethodDataSource] or a class row of another type under a
+            // [GenerateGenericTest]. Convert them to the parameter types, as reflection mode does (#7161).
+            writer.AppendRaw(InstanceFactoryGenerator.GenerateInstanceFactoryBody(testMethod.TypeSymbol.Construct(entry.ClassTypeArgs)));
         }
         else if (entry.HasParameterizedConstructor)
         {
@@ -1108,26 +1922,49 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
     private static void EmitConcreteInvokeBody(CodeWriter writer, TestMethodMetadata testMethod, ConcreteInstantiation entry)
     {
         var methodName = entry.MethodName;
-        var hasCancellationToken = testMethod.MethodSymbol.Parameters.Any(p =>
-            p.Type.Name == "CancellationToken" && p.Type.ContainingNamespace?.ToString() == "System.Threading");
+        var cancellationTokenCount = testMethod.MethodSymbol.Parameters.Count(p =>
+            p.Type.IsCancellationToken());
         var returnPattern = GetReturnPattern(testMethod.MethodSymbol);
 
+        if (entry.MethodConstraintViolations is [var violation, ..])
+        {
+            // The method cannot be called with these type arguments (it would not compile). The
+            // entry's data sources already fail test building, so this body is never reached.
+            writer.AppendLine($"return new global::System.Threading.Tasks.ValueTask(global::System.Threading.Tasks.Task.FromException(new global::TUnit.Core.Exceptions.GenericTypeResolutionException(\"{EscapeString(violation.Message)}\")));");
+            return;
+        }
+
+        // A trailing params/array parameter collects the remaining row values, a row may leave out
+        // optional parameters (#7146), and a single tuple parameter takes either the whole row or its
+        // spread elements, which the positional casts below cannot express. Bind them like a
+        // non-generic method instead, using the parameters of the closed method.
+        if ((entry.MethodTypeArgs.Length > 0 || entry.ClassTypeArgs.Length > 0)
+            && TryGetClosedParametersForSharedBinder(testMethod, entry) is { } closedParameters)
+        {
+            var invokedName = entry.MethodTypeArgs.Length > 0
+                ? $"{methodName}<{string.Join(", ", entry.MethodTypeArgs.Select(t => t.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)))}>"
+                : methodName;
+            GenerateConcreteTestInvokerBody(writer, invokedName, returnPattern, cancellationTokenCount, closedParameters);
+        }
         // For any generic context (class or method), we need to substitute type parameters
-        if (entry.MethodTypeArgs.Length > 0 || entry.ClassTypeArgs.Length > 0)
+        else if (entry.MethodTypeArgs.Length > 0 || entry.ClassTypeArgs.Length > 0)
         {
             // Build the method call with proper type substitution
             var parameterCasts = new List<string>();
+            // Row values hold only the data parameters; the engine supplies the CancellationToken,
+            // so a token before a data parameter must not shift the row index.
+            var dataArgIndex = 0;
             for (var i = 0; i < testMethod.MethodSymbol.Parameters.Length; i++)
             {
                 var param = testMethod.MethodSymbol.Parameters[i];
-                if (param.Type.Name == "CancellationToken" && param.Type.ContainingNamespace?.ToString() == "System.Threading")
+                if (param.Type.IsCancellationToken())
                 {
                     parameterCasts.Add("cancellationToken");
                 }
                 else
                 {
                     var paramType = SubstituteTypeParameters(param.Type, testMethod, entry.ClassTypeArgs, entry.MethodTypeArgs);
-                    parameterCasts.Add($"global::TUnit.Core.Helpers.CastHelper.Cast<{paramType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)}>(args[{i.ToString(CultureInfo.InvariantCulture)}])");
+                    parameterCasts.Add($"global::TUnit.Core.Helpers.CastHelper.Cast<{paramType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)}>(args[{dataArgIndex++.ToString(CultureInfo.InvariantCulture)}])");
                 }
             }
 
@@ -1180,10 +2017,88 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         {
             // Non-generic — use standard invoke (shouldn't normally reach here for generic path)
             var parametersFromArgs = testMethod.MethodSymbol.Parameters
-                .Where(p => p.Type.Name != "CancellationToken" || p.Type.ContainingNamespace?.ToString() != "System.Threading")
+                .Where(p => !p.Type.IsCancellationToken())
                 .ToArray();
-            GenerateConcreteTestInvokerBody(writer, methodName, returnPattern, hasCancellationToken, parametersFromArgs);
+            GenerateConcreteTestInvokerBody(writer, methodName, returnPattern, cancellationTokenCount, parametersFromArgs);
         }
+    }
+
+    /// <summary>
+    /// Returns the data-bound (non-CancellationToken) parameters of the closed test method when the
+    /// last one collects trailing arguments (<c>params T[]</c> or a plain array), when any of them
+    /// is optional, so a row may supply fewer values than there are parameters, or when the only
+    /// one is a tuple. Returns null when there is no such parameter, or the closed method cannot be built.
+    /// </summary>
+    private static IParameterSymbol[]? TryGetClosedParametersForSharedBinder(TestMethodMetadata testMethod, ConcreteInstantiation entry)
+    {
+        var parameters = testMethod.MethodSymbol.Parameters
+            .Where(p => !p.Type.IsCancellationToken())
+            .ToArray();
+
+        // The shared binder passes the test's token to every CancellationToken parameter, so a method
+        // declaring several no longer needs the positional path.
+        var collectsTrailingArguments = parameters.Length > 0 && parameters[parameters.Length - 1].CollectsTrailingArguments();
+        var hasOptionalParameters = parameters.Any(p => p.HasExplicitDefaultValue || p.IsOptional);
+        var bindsByShape = collectsTrailingArguments || hasOptionalParameters;
+        if (!bindsByShape && parameters.Length != 1)
+        {
+            return null;
+        }
+
+        // Keep the method as discovered: an inherited method already carries the type arguments its
+        // derived class supplied to the base (e.g. Derived : Base<int> gives int[] for T[]).
+        var method = testMethod.MethodSymbol;
+
+        if (entry.ClassTypeArgs.Length > 0)
+        {
+            if (testMethod.TypeSymbol.OriginalDefinition.TypeParameters.Length != entry.ClassTypeArgs.Length)
+            {
+                return null;
+            }
+
+            // Close the test class, then find the method on it or on one of its (now closed) base types.
+            var definition = testMethod.MethodSymbol.OriginalDefinition;
+            IMethodSymbol? closedMethod = null;
+            for (INamedTypeSymbol? type = testMethod.TypeSymbol.OriginalDefinition.Construct(entry.ClassTypeArgs);
+                 type is not null && closedMethod is null;
+                 type = type.BaseType)
+            {
+                closedMethod = type.GetMembers(definition.Name)
+                    .OfType<IMethodSymbol>()
+                    .FirstOrDefault(m => SymbolEqualityComparer.Default.Equals(m.OriginalDefinition, definition));
+            }
+
+            if (closedMethod is null)
+            {
+                return null;
+            }
+
+            method = closedMethod;
+        }
+
+        if (entry.MethodTypeArgs.Length > 0)
+        {
+            if (method.TypeParameters.Length != entry.MethodTypeArgs.Length
+                || !SymbolEqualityComparer.Default.Equals(method.ConstructedFrom, method))
+            {
+                return null;
+            }
+
+            method = method.Construct(entry.MethodTypeArgs);
+        }
+
+        // Select by the declared positions: once closed, a data parameter of type T can itself be a
+        // CancellationToken (e.g. [GenerateGenericTest(typeof(CancellationToken))]) and must stay a data argument.
+        var closedParameters = method.Parameters;
+        if (!bindsByShape
+            && closedParameters[parameters[0].Ordinal].Type is not INamedTypeSymbol { IsTupleType: true })
+        {
+            return null;
+        }
+
+        return parameters
+            .Select(p => closedParameters[p.Ordinal])
+            .ToArray();
     }
 
     /// <summary>
@@ -1203,7 +2118,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 // ArgumentsAttribute.OnTestRegistered) leak into its siblings. Leave the rows out:
                 // TestBuilder appends the data source that produced each test to that test's
                 // attributes, as it does for non-generic methods, whose list omits data sources too.
-                if (entry.AdditionalArgumentsAttributes is null && entry.IsSpecificDataSource(attr))
+                if (!entry.HasMergedRows && entry.IsSpecificMethodDataSource(attr))
                 {
                     filteredAttributes.Add(attr);
                 }
@@ -1339,24 +2254,51 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         // Method data sources
         List<AttributeData> methodDataSources;
         AttributeData[] classDataSources;
+        ClassDataSourcePartition? classDataSourcePartition = null;
 
         if (entry.SpecificArgumentsAttribute != null)
         {
-            methodDataSources = methodSymbol.GetAttributes()
-                .Where(entry.IsSpecificDataSource)
-                .ToList();
-
-            if (testMethod is { IsGenericType: true, IsGenericMethod: true })
+            if (!MethodParametersReferenceTypeParameters(testMethod))
             {
-                var additionalMethodDataSources = methodSymbol.GetAttributes()
-                    .Where(a => a.AttributeClass?.Name == "ArgumentsAttribute" &&
-                                !entry.IsSpecificDataSource(a));
-                methodDataSources.AddRange(additionalMethodDataSources);
+                // The method's parameters do not depend on any inferred type, so its data sources
+                // play no part in choosing the instantiation: every one of them applies, as on a
+                // non-generic class (#7106).
+                methodDataSources = methodSymbol.GetAttributes()
+                    .Where(a => DataSourceAttributeHelper.IsDataSourceAttribute(a.AttributeClass))
+                    .ToList();
+            }
+            else
+            {
+                methodDataSources = methodSymbol.GetAttributes()
+                    .Where(entry.IsSpecificMethodDataSource)
+                    .ToList();
+
+                if (testMethod is { IsGenericType: true, IsGenericMethod: true } && !entry.HasMethodRows)
+                {
+                    // Only the method rows that infer this entry's method type arguments: a row that
+                    // infers other types belongs to another instantiation (or fails its constraints).
+                    var compilation = testMethod.CompilationContext.Compilation;
+                    var additionalMethodDataSources = methodSymbol.GetAttributes()
+                        .Where(a => a.AttributeClass?.Name == "ArgumentsAttribute" &&
+                                    !entry.IsSpecificMethodDataSource(a) &&
+                                    InferredTypesMatch(InferTypesFromArgumentsAttribute(methodSymbol, a, compilation), entry.MethodTypeArgs));
+                    methodDataSources.AddRange(additionalMethodDataSources);
+                }
             }
 
-            classDataSources = typeSymbol.GetAttributesIncludingBaseTypes()
-                .Where(entry.IsSpecificDataSource)
-                .ToArray();
+            classDataSourcePartition = GetClassDataSourcePartition(testMethod, entry);
+            classDataSources = classDataSourcePartition is not null
+                ? classDataSourcePartition.DataSources
+                : entry.HasClassRows || entry.HasNoClassRow
+                ? typeSymbol.GetAttributesIncludingBaseTypes()
+                    .Where(entry.IsSpecificClassDataSource)
+                    .ToArray()
+                // Only method rows inferred this instantiation, so no class row is scoped to it. Its
+                // constructor arguments come from every class-level data source, as for a
+                // [GenerateGenericTest] instantiation, and as reflection mode builds it (#7161).
+                : typeSymbol.GetAttributesIncludingBaseTypes()
+                    .Where(a => DataSourceAttributeHelper.IsDataSourceAttribute(a.AttributeClass))
+                    .ToArray();
         }
         else
         {
@@ -1369,7 +2311,42 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 .ToArray();
         }
 
-        if (methodDataSources.Count > 0)
+        if (entry.MethodConstraintViolations is { Count: > 0 } violations)
+        {
+            // Replace the method data sources with ones whose rows fail test building with the
+            // constraint message: one failed test per invalid row, as reflection mode reports.
+            var dsWriter = new CodeWriter(includeHeader: false);
+            dsWriter.AppendLine("new global::TUnit.Core.IDataSourceAttribute[]");
+            dsWriter.AppendLine("{");
+            dsWriter.Indent();
+            var allMethodDataSources = methodSymbol.GetAttributes()
+                .Where(a => DataSourceAttributeHelper.IsDataSourceAttribute(a.AttributeClass))
+                .ToList();
+            foreach (var violation in violations)
+            {
+                var rowSources = violation.RowSource is { } rowSource
+                    ? [rowSource]
+                    : violation.AllMethodDataSources ? allMethodDataSources : [];
+                var message = $"\"{EscapeString(violation.Message)}\"";
+
+                if (rowSources.Count == 0)
+                {
+                    dsWriter.AppendLine($"global::TUnit.Core.GenericConstraintViolationDataSource.Create({message}),");
+                    continue;
+                }
+
+                foreach (var rowSourceAttribute in rowSources)
+                {
+                    var rowWriter = new CodeWriter(includeHeader: false);
+                    GenerateDataSourceAttribute(rowWriter, testMethod.CompilationContext, rowSourceAttribute, methodSymbol, concreteTypeSymbol);
+                    dsWriter.AppendLine($"global::TUnit.Core.GenericConstraintViolationDataSource.Create({message}, {rowWriter.ToString().Trim().TrimEnd(',')}),");
+                }
+            }
+            dsWriter.Unindent();
+            dsWriter.Append("}");
+            writer.AppendLine($"testDataSources: {dsWriter},");
+        }
+        else if (methodDataSources.Count > 0)
         {
             var dsWriter = new CodeWriter(includeHeader: false);
             dsWriter.AppendLine("new global::TUnit.Core.IDataSourceAttribute[]");
@@ -1387,6 +2364,13 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         if (classDataSources.Length > 0)
         {
             var dsWriter = new CodeWriter(includeHeader: false);
+            if (classDataSourcePartition is not null)
+            {
+                // Splits the rows of the sources whose row types the generator cannot see by the class type
+                // arguments they infer, as reflection mode does at discovery (#7210)
+                var typeArguments = string.Join(", ", entry.ClassTypeArgs.Select(t => $"typeof({t.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)})"));
+                dsWriter.Append($"global::TUnit.Core.GenericClassRowPartition.Create(new global::System.Type[] {{ {typeArguments} }}, global::TUnit.Core.GenericClassRowFallback.{classDataSourcePartition.Fallback}, ");
+            }
             dsWriter.AppendLine("new global::TUnit.Core.IDataSourceAttribute[]");
             dsWriter.AppendLine("{");
             dsWriter.Indent();
@@ -1396,8 +2380,153 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             }
             dsWriter.Unindent();
             dsWriter.Append("}");
+            if (classDataSourcePartition is not null)
+            {
+                dsWriter.Append($", {string.Join(", ", classDataSourcePartition.PartitionedIndices.Select(i => i.ToString(CultureInfo.InvariantCulture)))})");
+            }
             writer.AppendLine($"classDataSources: {dsWriter},");
         }
+    }
+
+    /// <summary>
+    /// Mirrors <c>TUnit.Core.GenericClassRowFallback</c>: what an instantiation uses when no row of its partitioned
+    /// class data sources infers its class type arguments.
+    /// </summary>
+    private enum ClassRowFallback
+    {
+        None,
+        AllRows,
+        NoClassRow,
+    }
+
+    /// <summary>
+    /// The class data sources of an instantiation whose rows are split at run time by the class type arguments they
+    /// infer. <paramref name="PartitionedIndices"/> are the sources whose row types the generator cannot see.
+    /// </summary>
+    private sealed record ClassDataSourcePartition(AttributeData[] DataSources, int[] PartitionedIndices, ClassRowFallback Fallback);
+
+    /// <summary>
+    /// For an instantiation of a generic class whose class-level data sources include one whose row types the
+    /// generator cannot see (a [MethodDataSource] returning <c>IEnumerable&lt;object&gt;</c>, say), the class data
+    /// sources to give its tests. Reflection mode groups class rows by the types of their values at discovery,
+    /// so each such source joins every instantiation and yields, at run time, only the rows whose values infer
+    /// its class type arguments (#7210). When no row infers them and no class row known at compile time does, the
+    /// instantiation falls back as reflection mode does: with class-level [Arguments] rows, no class row supplies
+    /// its constructor arguments (#7118); otherwise every class row does, converted (#7161). Null when the class
+    /// has no such source, or the instantiation's class data sources are not scoped to it.
+    /// </summary>
+    private static ClassDataSourcePartition? GetClassDataSourcePartition(TestMethodMetadata testMethod, ConcreteInstantiation entry)
+    {
+        if (!testMethod.IsGenericType || entry.ClassTypeArgs.Length == 0 || entry.SpecificArgumentsAttribute is null)
+        {
+            return null;
+        }
+
+        var typeSymbol = testMethod.TypeSymbol;
+        var allClassDataSources = typeSymbol.GetAttributesIncludingBaseTypes()
+            .Where(a => DataSourceAttributeHelper.IsDataSourceAttribute(a.AttributeClass))
+            .ToArray();
+
+        // A class-level [Arguments] row is typed by its values; other sources by their declared type arguments
+        var hasClassArgumentsRows = false;
+        var isUntyped = new bool[allClassDataSources.Length];
+        var classTypes = new ITypeSymbol[]?[allClassDataSources.Length];
+        for (var i = 0; i < allClassDataSources.Length; i++)
+        {
+            var attributeClass = allClassDataSources[i].AttributeClass!;
+            if (attributeClass.Name == "ArgumentsAttribute")
+            {
+                hasClassArgumentsRows = true;
+                continue;
+            }
+
+            classTypes[i] = InferClassTypesFromTypedClassDataSource(typeSymbol, attributeClass);
+            isUntyped[i] = classTypes[i] is null;
+        }
+
+        if (Array.IndexOf(isUntyped, true) < 0)
+        {
+            return null;
+        }
+
+        var dataSources = new List<AttributeData>(allClassDataSources.Length);
+        var partitionedIndices = new List<int>();
+        var hasCompileTimeClassRow = false;
+
+        if (entry.HasClassRows || entry.HasNoClassRow)
+        {
+            // The class rows scoped to this instantiation, with every untyped source, in declaration order
+            for (var i = 0; i < allClassDataSources.Length; i++)
+            {
+                if (isUntyped[i])
+                {
+                    partitionedIndices.Add(dataSources.Count);
+                    dataSources.Add(allClassDataSources[i]);
+                }
+                else if (entry.IsSpecificClassDataSource(allClassDataSources[i]))
+                {
+                    hasCompileTimeClassRow = true;
+                    dataSources.Add(allClassDataSources[i]);
+                }
+            }
+        }
+        else
+        {
+            // Only method rows inferred this instantiation. A typed source of these types supplies its class rows;
+            // without one, every class data source may build the instance (#7161).
+            var matchesTypedSource = new bool[allClassDataSources.Length];
+            for (var i = 0; i < allClassDataSources.Length; i++)
+            {
+                matchesTypedSource[i] = classTypes[i] is { } types && InferredTypesMatch(types, entry.ClassTypeArgs);
+                hasCompileTimeClassRow |= matchesTypedSource[i];
+            }
+
+            for (var i = 0; i < allClassDataSources.Length; i++)
+            {
+                if (isUntyped[i])
+                {
+                    partitionedIndices.Add(dataSources.Count);
+                    dataSources.Add(allClassDataSources[i]);
+                }
+                else if (!hasCompileTimeClassRow || matchesTypedSource[i])
+                {
+                    dataSources.Add(allClassDataSources[i]);
+                }
+            }
+        }
+
+        var fallback = hasCompileTimeClassRow ? ClassRowFallback.None
+            : hasClassArgumentsRows ? ClassRowFallback.NoClassRow
+            : ClassRowFallback.AllRows;
+
+        return new ClassDataSourcePartition(dataSources.ToArray(), partitionedIndices.ToArray(), fallback);
+    }
+
+    /// <summary>
+    /// Whether any test method parameter's type mentions a type parameter of the class or method,
+    /// i.e. whether method-level rows can take part in inferring the instantiation.
+    /// </summary>
+    private static bool MethodParametersReferenceTypeParameters(TestMethodMetadata testMethod)
+    {
+        foreach (var parameter in testMethod.MethodSymbol.Parameters)
+        {
+            if (ContainsTypeParameter(parameter.Type))
+            {
+                return true;
+            }
+        }
+
+        return false;
+
+        static bool ContainsTypeParameter(ITypeSymbol type) => type switch
+        {
+            ITypeParameterSymbol => true,
+            IArrayTypeSymbol array => ContainsTypeParameter(array.ElementType),
+            IPointerTypeSymbol pointer => ContainsTypeParameter(pointer.PointedAtType),
+            INamedTypeSymbol named => named.TypeArguments.Any(ContainsTypeParameter)
+                || named.ContainingType is { } containing && ContainsTypeParameter(containing),
+            _ => false,
+        };
     }
 
     private static void GenerateMetadata(CodeWriter writer, TestMethodMetadata testMethod, bool useNamedMethods = false)
@@ -1598,7 +2727,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
 
         if (attrName == "global::TUnit.Core.MethodDataSourceAttribute")
         {
-            GenerateMethodDataSourceAttribute(writer, attr, typeSymbol);
+            GenerateMethodDataSourceAttribute(writer, attr, typeSymbol, compilationContext.Compilation);
         }
         else if (attrName == "global::TUnit.Core.ArgumentsAttribute")
         {
@@ -1887,7 +3016,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         return true;
     }
 
-    private static void GenerateMethodDataSourceAttribute(CodeWriter writer, AttributeData attr, INamedTypeSymbol typeSymbol)
+    private static void GenerateMethodDataSourceAttribute(CodeWriter writer, AttributeData attr, INamedTypeSymbol typeSymbol, Compilation compilation)
     {
         // Extract method name and target type
         string? methodName = null;
@@ -1930,26 +3059,17 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             return;
         }
 
-        // Find the data source method, property, or field.
-        // Walk base types too: with [InheritsTests] (or a data member declared on a base class)
-        // the member may not be declared directly on the test class. Missing it here would emit
-        // a plain MethodDataSourceAttribute without a Factory, which falls back to
-        // Activator.CreateInstance at runtime and fails for classes without a parameterless
-        // constructor (https://github.com/thomhurst/TUnit/issues/6162).
-        ISymbol? dataSourceMember = null;
-        for (var searchType = targetType; searchType is not null; searchType = searchType.BaseType)
-        {
-            var members = searchType.GetMembers(methodName!);
-            if (members.Length > 0)
-            {
-                dataSourceMember = members[0];
-                break;
-            }
-        }
+        // Find the data source method, property, or field. Generic type inference reads the same
+        // member (see InferTypesFromMethodDataSource), so the generated factory and the closed
+        // test method always agree on the row type.
+        var dataSourceMember = ResolveMethodDataSourceMember(targetType, methodName!, attr, compilation);
         var dataSourceMethod = dataSourceMember as IMethodSymbol;
         var dataSourceProperty = dataSourceMember as IPropertySymbol;
+        var dataSourceField = dataSourceMember as IFieldSymbol;
 
-        if (dataSourceMember == null || (dataSourceMethod == null && dataSourceProperty == null))
+        if (dataSourceMember == null
+            || (dataSourceMethod == null && dataSourceProperty == null && dataSourceField == null)
+            || (dataSourceMethod == null && !CanReadDataSourceMember(dataSourceMember, compilation)))
         {
             // Still generate the attribute even if method not found - it will fail at runtime with proper error
             // Use CodeGenerationHelpers to properly handle any generics on the attribute
@@ -1962,7 +3082,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         // We need to manually construct this to properly add the Factory property
 
         // Determine if the data source is static or instance-based
-        var isStatic = dataSourceMethod?.IsStatic ?? dataSourceProperty?.GetMethod?.IsStatic ?? true;
+        var isStatic = dataSourceMethod?.IsStatic ?? dataSourceProperty?.GetMethod?.IsStatic ?? dataSourceField?.IsStatic ?? true;
 
         // InstanceMethodDataSourceAttribute means "use the test class instance". If the
         // attribute explicitly targets a separate provider type, create that provider in
@@ -2038,7 +3158,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         // a per-data-source compiler-generated state machine class (#6227). Only the per-test-unique
         // invocation is emitted, as a static lambda.
         writer.Append("Factory = static dataGeneratorMetadata => ");
-        EmitDataSourceFactoryInvocation(writer, dataSourceMember, targetType, usesTestClassInstance, hasArguments ? argumentsProperty.Value : (TypedConstant?)null);
+        EmitDataSourceFactoryInvocation(writer, dataSourceMember, targetType, usesTestClassInstance, hasArguments ? argumentsProperty.Value : (TypedConstant?)null, compilation);
         writer.AppendLine(",");
 
         writer.Unindent();
@@ -2051,13 +3171,17 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
     /// member's declared return type (mirroring the previous inline-iterator branch order)
     /// and whether the member is static or instance-based.
     /// </summary>
-    private static void EmitDataSourceFactoryInvocation(CodeWriter writer, ISymbol dataSourceMember, ITypeSymbol targetType, bool usesTestClassInstance, TypedConstant? arguments)
+    private static void EmitDataSourceFactoryInvocation(CodeWriter writer, ISymbol dataSourceMember, ITypeSymbol targetType, bool usesTestClassInstance, TypedConstant? arguments, Compilation compilation)
     {
         var dataSourceMethod = dataSourceMember as IMethodSymbol;
-        var dataSourceProperty = dataSourceMember as IPropertySymbol;
 
-        var returnType = dataSourceMethod?.ReturnType ?? dataSourceProperty!.Type;
-        var isStatic = dataSourceMethod?.IsStatic ?? dataSourceProperty!.IsStatic;
+        var returnType = dataSourceMember switch
+        {
+            IMethodSymbol method => method.ReturnType,
+            IPropertySymbol property => property.Type,
+            _ => ((IFieldSymbol)dataSourceMember).Type
+        };
+        var isStatic = dataSourceMember.IsStatic;
         var fullyQualifiedType = targetType.GloballyQualified();
 
         string kind;
@@ -2086,27 +3210,93 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             ? $"global::TUnit.Core.Helpers.DataSourceFactories.From{kind}"
             : $"global::TUnit.Core.Helpers.DataSourceFactories.FromInstance{kind}";
 
-        var hasArguments = arguments != null && dataSourceMethod is { Parameters.Length: > 0 };
+        // A method with parameters goes through BuildDataSourceCallArguments even without Arguments, so a
+        // CancellationToken or optional parameter is filled in as reflection mode's BuildInvokeArgs does.
+        var hasArguments = dataSourceMethod is { Parameters.Length: > 0 };
+
+        // A method declared on a base type is called through that type: on the target type, C# overload
+        // resolution drops a base overload whenever a derived one is applicable, so it could call another
+        // overload than the one ResolveMethodDataSourceMember chose (https://github.com/thomhurst/TUnit/issues/7202).
+        // An override counts as declared where its virtual method is, so it is called through that type and
+        // dispatches to the override at run time.
+        var declaringMethod = dataSourceMethod;
+        while (declaringMethod?.OverriddenMethod is { } overridden)
+        {
+            declaringMethod = overridden;
+        }
+
+        var callsThroughDeclaringType = declaringMethod != null && IsShadowedOnTargetType(declaringMethod, targetType);
+        var receiverType = callsThroughDeclaringType
+            ? declaringMethod!.ContainingType.GloballyQualified()
+            : fullyQualifiedType;
+
+        // An override called through its base declaration binds to that declaration at compile time, so C# would
+        // take the base's parameter names and defaults and its (possibly wider) return type. Reflection invokes the
+        // override itself, so the override's defaults are passed explicitly and its return type is restored.
+        var overrideBoundToBase = callsThroughDeclaringType
+            && !SymbolEqualityComparer.Default.Equals(declaringMethod, dataSourceMethod)
+            ? declaringMethod
+            : null;
+        var receiver = isStatic
+            ? receiverType
+            : usesTestClassInstance
+                ? $"(({receiverType})instance)"
+                : receiverType == fullyQualifiedType
+                    ? $"new {fullyQualifiedType}()"
+                    : $"(({receiverType})new {fullyQualifiedType}())";
+        var lambdaHeader = usesTestClassInstance ? "static instance =>" : "static () =>";
+        var metadataArgument = usesTestClassInstance ? "dataGeneratorMetadata, " : "";
+
+        // A declared type such as object does not say whether the value is one row or many. Reflection mode, and the
+        // attribute's reflection fallback that read every field and every private or protected property before the
+        // generator could, decide from the runtime value, so these factories hand the value to that same logic
+        // instead of FromValue. Accessible properties and methods keep FromValue, as their generated code always has
+        // (https://github.com/thomhurst/TUnit/issues/7178).
+        var isAccessibleMember = dataSourceMethod != null || IsAccessibleDataSourceMember(dataSourceMember, compilation);
+        if (kind == "Value" && (dataSourceMember is IFieldSymbol || !isAccessibleMember))
+        {
+            helper = isStatic || !usesTestClassInstance
+                ? "global::TUnit.Core.Helpers.DataSourceFactories.FromRuntimeValue"
+                : "global::TUnit.Core.Helpers.DataSourceFactories.FromInstanceRuntimeValue";
+            metadataArgument = "dataGeneratorMetadata, ";
+        }
+
+        if (!isAccessibleMember)
+        {
+            // The generated class cannot name a private or protected field or property, so the factory reads it by
+            // reflection. GetField/GetProperty on a typeof() with a constant name and binding flags is understood
+            // by the trimmer and the AOT compiler, which keep that member, so this works under native AOT
+            // without any trimming warning. The attribute's own reflection fallback finds the member from the
+            // test class type at run time, which neither of them can see.
+            var lookup = dataSourceMember is IFieldSymbol ? "GetField" : "GetProperty";
+            var bindingFlags = (isStatic ? "global::System.Reflection.BindingFlags.Static" : "global::System.Reflection.BindingFlags.Instance")
+                + " | global::System.Reflection.BindingFlags.Public | global::System.Reflection.BindingFlags.NonPublic | global::System.Reflection.BindingFlags.DeclaredOnly";
+            var target = isStatic ? "null" : usesTestClassInstance ? "instance" : $"new {fullyQualifiedType}()";
+            var cast = kind is "Value" or "Enumerable" ? "" : $"({returnType.GloballyQualified()})";
+            writer.Append($"{helper}({metadataArgument}{lambdaHeader} {cast}typeof({dataSourceMember.ContainingType.GloballyQualified()}).{lookup}(\"{dataSourceMember.Name}\", {bindingFlags})!.GetValue({target}))");
+            return;
+        }
 
         string memberAccess;
         if (dataSourceMethod != null)
         {
             memberAccess = hasArguments
-                ? $"{dataSourceMethod.Name}({string.Join(", ", dataSourceMethod.Parameters.Select((p, i) => $"(({p.Type.GloballyQualified()})arguments[{i.ToString(CultureInfo.InvariantCulture)}])"))})"
-                : $"{dataSourceMethod.Name}()";
+                ? $"{IdentifierHelper.Escape(dataSourceMethod.Name)}({BuildDataSourceCallArguments(dataSourceMethod, arguments ?? default, compilation, overrideBoundToBase)})"
+                : $"{IdentifierHelper.Escape(dataSourceMethod.Name)}()";
         }
         else
         {
-            memberAccess = dataSourceProperty!.Name;
+            memberAccess = IdentifierHelper.Escape(dataSourceMember.Name);
         }
 
-        var receiver = isStatic
-            ? fullyQualifiedType
-            : usesTestClassInstance
-                ? $"(({fullyQualifiedType})instance)"
-                : $"new {fullyQualifiedType}()";
-        var lambdaHeader = usesTestClassInstance ? "static instance =>" : "static () =>";
-        var metadataArgument = usesTestClassInstance ? "dataGeneratorMetadata, " : "";
+        var call = $"{receiver}.{memberAccess}";
+        if (overrideBoundToBase != null
+            && !SymbolEqualityComparer.Default.Equals(overrideBoundToBase.ReturnType, dataSourceMethod!.ReturnType))
+        {
+            // A covariant override returns a narrower type than its base declaration, and the helper chosen
+            // from it (FromTask<T>, say) needs that type
+            call = $"(({dataSourceMethod.ReturnType.GloballyQualified()}){call})";
+        }
 
         if (hasArguments)
         {
@@ -2114,16 +3304,89 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             writer.AppendLine("{");
             writer.Indent();
             writer.Append("var arguments = ");
-            WriteTypedConstant(writer, arguments!.Value);
+            if (arguments is { } suppliedArguments)
+            {
+                WriteTypedConstant(writer, suppliedArguments);
+            }
+            else
+            {
+                writer.Append("global::System.Array.Empty<object?>()");
+            }
             writer.AppendLine(";");
-            writer.AppendLine($"return {receiver}.{memberAccess};");
+            writer.AppendLine($"return {call};");
             writer.Unindent();
             writer.Append("})");
         }
         else
         {
-            writer.Append($"{helper}({metadataArgument}{lambdaHeader} {receiver}.{memberAccess})");
+            writer.Append($"{helper}({metadataArgument}{lambdaHeader} {call})");
         }
+    }
+
+    /// <summary>
+    /// Whether a call on <paramref name="targetType"/> might not reach <paramref name="declaringMethod"/>, a method that
+    /// is not an override: some type from the target type down to, but excluding, the method's declaring type
+    /// declares a member of that name other than an override. C# overload resolution then removes the base methods
+    /// once that member applies, so the call must go through the declaring type.
+    /// </summary>
+    private static bool IsShadowedOnTargetType(IMethodSymbol declaringMethod, ITypeSymbol targetType)
+    {
+        for (var type = targetType; type is not null; type = type.BaseType)
+        {
+            if (SymbolEqualityComparer.Default.Equals(type, declaringMethod.ContainingType))
+            {
+                return false;
+            }
+
+            foreach (var member in type.GetMembers(declaringMethod.Name))
+            {
+                if (!member.IsOverride)
+                {
+                    return true;
+                }
+            }
+        }
+
+        // Not reached for a member ResolveMethodDataSourceMember found on the target type's hierarchy; keep the
+        // target type as the receiver, as before
+        return false;
+    }
+
+    /// <summary>
+    /// Whether the generated class can read the data source field or property directly: the member and its getter
+    /// are accessible from the test assembly, so not private or protected.
+    /// </summary>
+    private static bool IsAccessibleDataSourceMember(ISymbol member, Compilation compilation)
+    {
+        return compilation.IsSymbolAccessibleWithin(member, compilation.Assembly)
+            && (member is not IPropertySymbol property
+                || (property.GetMethod is { } getter && compilation.IsSymbolAccessibleWithin(getter, compilation.Assembly)));
+    }
+
+    /// <summary>
+    /// Whether a generated factory can read the data source field or property, directly or, for a private or
+    /// protected member, by reflection on its declaring type. That needs a declaring type that the generated class
+    /// can name without type parameters, a getter for a property, and a member type it can name when the factory
+    /// casts the value. Otherwise the attribute keeps its reflection fallback.
+    /// </summary>
+    private static bool CanReadDataSourceMember(ISymbol member, Compilation compilation)
+    {
+        if (member is IPropertySymbol { GetMethod: null } or IPropertySymbol { IsIndexer: true })
+        {
+            return false;
+        }
+
+        if (IsAccessibleDataSourceMember(member, compilation))
+        {
+            return true;
+        }
+
+        // EmitDataSourceFactoryInvocation casts the value for the async helpers, which take a typed delegate
+        var memberType = member is IPropertySymbol property ? property.Type : ((IFieldSymbol)member).Type;
+        var castsValue = IsAsyncEnumerable(memberType) || IsValueTask(memberType) || IsTask(memberType);
+        return compilation.IsSymbolAccessibleWithin(member.ContainingType, compilation.Assembly)
+            && !CodeGenerationHelpers.ContainsTypeParameter(member.ContainingType)
+            && (!castsValue || compilation.IsSymbolAccessibleWithin(memberType, compilation.Assembly));
     }
 
     private static bool IsAsyncEnumerable(ITypeSymbol type)
@@ -2183,82 +3446,35 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         return InterfaceHelper.IsEnumerable(type);
     }
 
+    private static readonly TypedConstantFormatter TypedConstantLiteralFormatter = new();
+
+    /// <summary>
+    /// Writes an attribute argument as a C# expression of the same type, so a boxed value keeps its type:
+    /// <c>1.5f</c> stays a <c>float</c> and <c>16L</c> a <c>long</c>, as in the attribute reflection mode reads.
+    /// </summary>
     private static void WriteTypedConstant(CodeWriter writer, TypedConstant constant)
     {
-        if (constant.IsNull)
+        if (constant is { Kind: TypedConstantKind.Array, IsNull: false })
         {
-            writer.Append("null");
+            var elementType = constant.Type is IArrayTypeSymbol arrayType
+                ? arrayType.ElementType.GloballyQualified()
+                : "object";
+            writer.Append($"new {elementType}[] {{ ");
+            for (var i = 0; i < constant.Values.Length; i++)
+            {
+                WriteTypedConstant(writer, constant.Values[i]);
+                if (i < constant.Values.Length - 1)
+                {
+                    writer.Append(", ");
+                }
+            }
+            writer.Append(" }");
             return;
         }
 
-        switch (constant.Kind)
-        {
-            case TypedConstantKind.Primitive:
-                if (constant.Type?.SpecialType == SpecialType.System_String)
-                {
-                    var stringValue = constant.Value.ToInvariantString() ?? "";
-                    var escapedValue = stringValue
-                        .Replace("\\", "\\\\")
-                        .Replace("\"", "\\\"")
-                        .Replace("\r", "\\r")
-                        .Replace("\n", "\\n")
-                        .Replace("\t", "\\t");
-                    writer.Append($"\"{escapedValue}\"");
-                }
-                else if (constant.Type?.SpecialType == SpecialType.System_Char)
-                {
-                    var charValue = constant.Value.ToInvariantString() ?? "";
-                    var escapedChar = charValue
-                        .Replace("\\", "\\\\")
-                        .Replace("'", "\\'")
-                        .Replace("\r", "\\r")
-                        .Replace("\n", "\\n")
-                        .Replace("\t", "\\t");
-                    writer.Append($"'{escapedChar}'");
-                }
-                else if (constant.Type?.SpecialType == SpecialType.System_Boolean)
-                {
-                    writer.Append(constant.Value?.ToString()?.ToLowerInvariant() ?? "false");
-                }
-                else
-                {
-                    // Handle numeric types with InvariantCulture to ensure consistent formatting
-                    if (constant.Value is IFormattable formattable)
-                    {
-                        writer.Append(formattable.ToString(null, CultureInfo.InvariantCulture));
-                    }
-                    else
-                    {
-                        writer.Append(constant.Value.ToInvariantString() ?? "null");
-                    }
-                }
-                break;
-
-            case TypedConstantKind.Type:
-                var type = constant.Value as ITypeSymbol;
-                writer.Append($"typeof({type?.GloballyQualified()})");
-                break;
-
-            case TypedConstantKind.Array:
-                var elementType = constant.Type is IArrayTypeSymbol arrayType
-                    ? arrayType.ElementType.GloballyQualified()
-                    : "object";
-                writer.Append($"new {elementType}[] {{ ");
-                for (var i = 0; i < constant.Values.Length; i++)
-                {
-                    WriteTypedConstant(writer, constant.Values[i]);
-                    if (i < constant.Values.Length - 1)
-                    {
-                        writer.Append(", ");
-                    }
-                }
-                writer.Append(" }");
-                break;
-
-            default:
-                writer.Append("null");
-                break;
-        }
+        // No target type: each value is written as its own type, with a literal suffix or cast where needed,
+        // and enum values as enum members.
+        writer.Append(TypedConstantLiteralFormatter.FormatForCode(constant));
     }
 
     private static void GeneratePropertyInjections(CodeWriter writer, INamedTypeSymbol typeSymbol, string className)
@@ -2724,26 +3940,99 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             }
             else
             {
-                var (hasCancellationToken, parametersFromArgs) = ParseInvokerParameters(testMethod.MethodSymbol);
+                var (cancellationTokenCount, parametersFromArgs) = ParseInvokerParameters(testMethod.MethodSymbol);
                 var returnPattern = GetReturnPattern(testMethod.MethodSymbol);
-                GenerateConcreteTestInvoker(writer, testMethod.MethodSymbol.Name, returnPattern, hasCancellationToken, parametersFromArgs);
+                GenerateConcreteTestInvoker(writer, testMethod.MethodSymbol.Name, returnPattern, cancellationTokenCount, parametersFromArgs);
             }
         }
     }
 
-    private static void GenerateConcreteTestInvoker(CodeWriter writer, string methodName, TestReturnPattern returnPattern, bool hasCancellationToken, IParameterSymbol[] parametersFromArgs)
+    private static void GenerateConcreteTestInvoker(CodeWriter writer, string methodName, TestReturnPattern returnPattern, int cancellationTokenCount, IParameterSymbol[] parametersFromArgs)
     {
         // Generate InvokeTypedTest which is required by CreateExecutableTestFactory
         writer.AppendLine("InvokeTypedTest = static (instance, args, cancellationToken) =>");
         writer.AppendLine("{");
         writer.Indent();
-        GenerateConcreteTestInvokerBody(writer, methodName, returnPattern, hasCancellationToken, parametersFromArgs);
+        GenerateConcreteTestInvokerBody(writer, methodName, returnPattern, cancellationTokenCount, parametersFromArgs);
         writer.Unindent();
         writer.AppendLine("},");
     }
 
-    private static void GenerateConcreteTestInvokerBody(CodeWriter writer, string methodName, TestReturnPattern returnPattern, bool hasCancellationToken, IParameterSymbol[] parametersFromArgs, bool wrapInTryCatch = true)
+    /// <summary>
+    /// Adds the test's token for every CancellationToken parameter of the method that declares
+    /// <paramref name="parametersFromArgs"/>. A token declared before the last data parameter goes back
+    /// to its declared position; later ones are appended, by name when <paramref name="nameTrailingTokens"/> is set.
+    /// </summary>
+    private static void AddCancellationTokenArguments(List<InvocationArgument> arguments, IParameterSymbol[] parametersFromArgs, string tokenArgument, bool nameTrailingTokens)
     {
+        var lastDataParameter = parametersFromArgs[parametersFromArgs.Length - 1];
+        if (lastDataParameter.ContainingSymbol is not IMethodSymbol method)
+        {
+            return;
+        }
+
+        foreach (var parameter in method.Parameters)
+        {
+            // Check the declared type: a closed T that happens to be CancellationToken is a data parameter.
+            if (!parameter.OriginalDefinition.Type.IsCancellationToken())
+            {
+                continue;
+            }
+
+            if (parameter.Ordinal < lastDataParameter.Ordinal)
+            {
+                InsertLeadingCancellationToken(arguments, parameter.Ordinal, parameter.Name, tokenArgument);
+            }
+            else
+            {
+                arguments.Add(new InvocationArgument(tokenArgument, nameTrailingTokens ? parameter.Name : null));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Inserts a non-trailing CancellationToken argument at its declared position. When an
+    /// argument before that position was omitted or named (an omitted optional before the
+    /// trailing array), the token is appended by name instead, which C# allows after named arguments.
+    /// </summary>
+    private static void InsertLeadingCancellationToken(List<InvocationArgument> arguments, int tokenIndex, string tokenName, string tokenArgument)
+    {
+        var positional = tokenIndex <= arguments.Count;
+        for (var i = 0; positional && i < tokenIndex; i++)
+        {
+            positional = !arguments[i].IsNamed;
+        }
+
+        if (positional)
+        {
+            arguments.Insert(tokenIndex, new InvocationArgument(tokenArgument));
+        }
+        else
+        {
+            arguments.Add(new InvocationArgument(tokenArgument, tokenName));
+        }
+    }
+
+    /// <summary>
+    /// Formats the argument list for a method with one data parameter, placing each
+    /// CancellationToken at its declared position.
+    /// </summary>
+    private static string FormatSingleArgumentCall(string argument, bool hasCancellationToken, IParameterSymbol[] parametersFromArgs)
+    {
+        if (!hasCancellationToken)
+        {
+            return argument;
+        }
+
+        var arguments = new List<InvocationArgument> { new(argument) };
+        AddCancellationTokenArguments(arguments, parametersFromArgs, "cancellationToken", nameTrailingTokens: false);
+        return string.Join(", ", arguments);
+    }
+
+    private static void GenerateConcreteTestInvokerBody(CodeWriter writer, string methodName, TestReturnPattern returnPattern, int cancellationTokenCount, IParameterSymbol[] parametersFromArgs, bool wrapInTryCatch = true)
+    {
+        var hasCancellationToken = cancellationTokenCount > 0;
+
         // Wrap entire body in try-catch to handle synchronous exceptions. The class-level
         // __Invoke switch opts out and wraps the whole switch in a single handler instead.
         if (wrapInTryCatch)
@@ -2778,9 +4067,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 $"global::TUnit.Core.Helpers.CastHelper.Cast<{elem.Type.GloballyQualified()}>(args[{i.ToString(CultureInfo.InvariantCulture)}])");
             var tupleConstruction = $"({string.Join(", ", tupleElements)})";
 
-            var methodCallReconstructed = hasCancellationToken
-                ? $"instance.{methodName}({tupleConstruction}, cancellationToken)"
-                : $"instance.{methodName}({tupleConstruction})";
+            var methodCallReconstructed = $"instance.{methodName}({FormatSingleArgumentCall(tupleConstruction, hasCancellationToken, parametersFromArgs)})";
             GenerateReturnHandling(writer, methodCallReconstructed, returnPattern);
             writer.Unindent();
             writer.AppendLine("}");
@@ -2788,9 +4075,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             writer.AppendLine("{");
             writer.Indent();
             writer.AppendLine("// Rare case: tuple is wrapped as a single argument");
-            var methodCallDirect = hasCancellationToken
-                ? $"instance.{methodName}(global::TUnit.Core.Helpers.CastHelper.Cast<{singleTupleParam.GloballyQualified()}>(args[0]), cancellationToken)"
-                : $"instance.{methodName}(global::TUnit.Core.Helpers.CastHelper.Cast<{singleTupleParam.GloballyQualified()}>(args[0]))";
+            var methodCallDirect = $"instance.{methodName}({FormatSingleArgumentCall($"global::TUnit.Core.Helpers.CastHelper.Cast<{singleTupleParam.GloballyQualified()}>(args[0])", hasCancellationToken, parametersFromArgs)})";
             GenerateReturnHandling(writer, methodCallDirect, returnPattern);
             writer.Unindent();
             writer.AppendLine("}");
@@ -2803,9 +4088,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         }
         else if (parametersFromArgs.Length == 0)
         {
-            var typedMethodCall = hasCancellationToken
-                ? $"instance.{methodName}(cancellationToken)"
-                : $"instance.{methodName}()";
+            var typedMethodCall = $"instance.{methodName}({string.Join(", ", Enumerable.Repeat("cancellationToken", cancellationTokenCount))})";
             GenerateReturnHandling(writer, typedMethodCall, returnPattern);
         }
         else
@@ -2851,7 +4134,16 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 // Add CancellationToken if present
                 if (hasCancellationToken)
                 {
-                    argsToPass.Add("context?.Execution.CancellationToken ?? global::System.Threading.CancellationToken.None");
+                    const string cancellationTokenArgument = "context?.Execution.CancellationToken ?? global::System.Threading.CancellationToken.None";
+
+                    // Omitted optionals normally get their defaults passed explicitly. When a default
+                    // cannot be written out, the parameter is left out: a positional token would then
+                    // bind to the first omitted slot, and a positional argument cannot follow the
+                    // trailing array passed by name (CS8323), so the tokens need their names as well.
+                    var nameTrailingTokens = argsToPass.Count < parametersFromArgs.Length;
+
+                    // A token declared before a data parameter goes back to its declared position.
+                    AddCancellationTokenArguments(argsToPass, parametersFromArgs, cancellationTokenArgument, nameTrailingTokens);
                 }
 
                 var typedMethodCall = $"instance.{methodName}({string.Join(", ", argsToPass)})";
@@ -2886,7 +4178,8 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 var dynamicArgs = TupleArgumentHelper.GenerateArgumentAccessWithParams(parametersFromArgs, "args", "args.Length");
                 if (hasCancellationToken)
                 {
-                    dynamicArgs.Add("context?.Execution.CancellationToken ?? global::System.Threading.CancellationToken.None");
+                    const string cancellationTokenArgument = "context?.Execution.CancellationToken ?? global::System.Threading.CancellationToken.None";
+                    AddCancellationTokenArguments(dynamicArgs, parametersFromArgs, cancellationTokenArgument, nameTrailingTokens: false);
                 }
 
                 var dynamicMethodCall = $"instance.{methodName}({string.Join(", ", dynamicArgs)})";
@@ -2928,19 +4221,21 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             .Concat(testMethod.TypeSymbol.ContainingAssembly.GetAttributes());
     }
 
-    private static (bool HasCancellationToken, IParameterSymbol[] ParametersFromArgs) ParseInvokerParameters(IMethodSymbol methodSymbol)
+    private static (int CancellationTokenCount, IParameterSymbol[] ParametersFromArgs) ParseInvokerParameters(IMethodSymbol methodSymbol)
     {
-        var parameters = methodSymbol.Parameters;
-
-        var hasCancellationToken = parameters.Length > 0 &&
-            parameters.Last().Type.GloballyQualified() == "global::System.Threading.CancellationToken";
-
-        var parametersFromArgs = hasCancellationToken
-            ? parameters.Take(parameters.Length - 1).ToArray()
-            : parameters.ToArray();
-
-        return (hasCancellationToken, parametersFromArgs);
+        // The engine passes the test's token to every CancellationToken parameter wherever it is
+        // declared, so they take no row value (as in reflection mode).
+        var parametersFromArgs = GetDataParameters(methodSymbol);
+        return (methodSymbol.Parameters.Length - parametersFromArgs.Length, parametersFromArgs);
     }
+
+    /// <summary>
+    /// The parameters a data row binds to: every parameter except CancellationTokens, which the
+    /// engine supplies wherever they are declared.
+    /// </summary>
+    /// <remarks>Keep in step with the other copies of this rule: TUnit0001 (<c>ParameterExtensions.WithoutTestMethodCancellationTokens</c>), the generator (<c>TestMetadataGenerator.GetDataParameters</c>), the runtime (<c>DataGeneratorMetadataCreator.FilterOutCancellationToken</c>, <c>DataUnwrapper</c>) and reflection discovery (<c>ReflectionTestMetadata</c>, <c>ReflectionTestDataCollector</c>).</remarks>
+    private static IParameterSymbol[] GetDataParameters(IMethodSymbol methodSymbol)
+        => methodSymbol.Parameters.Where(p => !p.Type.IsCancellationToken()).ToArray();
 
     private static HashSet<string> ExtractCategories(TestMethodMetadata testMethod)
     {
@@ -3225,12 +4520,12 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
     {
         var writer = new CodeWriter(includeHeader: false);
 
-        var (hasCancellationToken, parametersFromArgs) = ParseInvokerParameters(testMethod.MethodSymbol);
+        var (cancellationTokenCount, parametersFromArgs) = ParseInvokerParameters(testMethod.MethodSymbol);
         var returnPattern = GetReturnPattern(testMethod.MethodSymbol);
 
         writer.AppendLine("{");
         writer.Indent();
-        GenerateConcreteTestInvokerBody(writer, testMethod.MethodSymbol.Name, returnPattern, hasCancellationToken, parametersFromArgs, wrapInTryCatch: false);
+        GenerateConcreteTestInvokerBody(writer, testMethod.MethodSymbol.Name, returnPattern, cancellationTokenCount, parametersFromArgs, wrapInTryCatch: false);
         writer.Unindent();
         writer.AppendLine("}");
 
@@ -3305,7 +4600,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
 
         if (!methodSymbol.ReturnsVoid)
         {
-            writer.AppendLine($"returnType: typeof({methodSymbol.ReturnType.GloballyQualified()}),");
+            writer.AppendLine($"returnType: typeof({ReturnTypeForTypeOf(methodSymbol.ReturnType)}),");
         }
 
         if (methodSymbol.TypeParameters.Length > 0)
@@ -3326,11 +4621,67 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
     }
 
     /// <summary>
+    /// The type to name in <c>typeof(...)</c> for a test method's return type. The metadata is emitted
+    /// outside the method and its class, so a return type that uses a type parameter cannot name it.
+    /// <see cref="TypeExtensions.GloballyQualified"/> opens a generic type whose arguments are type
+    /// parameters (<c>Task&lt;T&gt;</c> becomes <c>Task&lt;&gt;</c>), but not one that nests them
+    /// (<c>Task&lt;T[]&gt;</c>) or takes them from a containing type (<c>Outer&lt;T&gt;.Inner</c>), and a
+    /// bare <c>T</c> or <c>T[]</c> has no open form. Those become the open generic type and
+    /// <c>object</c>, as parameter metadata does.
+    /// </summary>
+    private static string ReturnTypeForTypeOf(ITypeSymbol returnType)
+    {
+        if (!ReferencesTypeParameter(returnType))
+        {
+            return returnType.GloballyQualified();
+        }
+
+        if (returnType is INamedTypeSymbol namedType)
+        {
+            return OpenGenericTypeOf(namedType);
+        }
+
+        return "object";
+
+        // Unlike CodeGenerationHelpers.ContainsTypeParameter, this also looks at containing types:
+        // Outer<T>.Inner has no type arguments of its own, but still mentions T.
+        static bool ReferencesTypeParameter(ITypeSymbol type) => type switch
+        {
+            ITypeParameterSymbol => true,
+            IArrayTypeSymbol arrayType => ReferencesTypeParameter(arrayType.ElementType),
+            INamedTypeSymbol named => named.TypeArguments.Any(ReferencesTypeParameter)
+                || (named.ContainingType is { } containingType && ReferencesTypeParameter(containingType)),
+            _ => false,
+        };
+
+        // The unbound form of the type and every type that contains it, such as
+        // global::Outer<>.Inner<,>. C# only accepts an unbound generic name in typeof when every
+        // generic level is unbound. Roslyn displays Nullable<T> as `T?`, so the name is built from
+        // the definition's parts rather than from its display string.
+        static string OpenGenericTypeOf(INamedTypeSymbol type)
+        {
+            var definition = type.OriginalDefinition;
+            var name = definition.Arity > 0
+                ? $"{definition.Name}<{new string(',', definition.Arity - 1)}>"
+                : definition.Name;
+
+            if (definition.ContainingType is { } containingType)
+            {
+                return $"{OpenGenericTypeOf(containingType)}.{name}";
+            }
+
+            return definition.ContainingNamespace is { IsGlobalNamespace: false } containingNamespace
+                ? $"{containingNamespace.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)}.{name}"
+                : $"global::{name}";
+        }
+    }
+
+    /// <summary>
     /// Generates a MethodMetadataFactory.Create(...) call expression referencing __classType and __classMetadata.
     /// </summary>
     private static string GenerateMethodMetadataFactoryCall(IMethodSymbol methodSymbol)
     {
-        var returnType = methodSymbol.ReturnType.GloballyQualified();
+        var returnType = ReturnTypeForTypeOf(methodSymbol.ReturnType);
         var sb = new System.Text.StringBuilder();
         sb.Append($"global::TUnit.Core.MethodMetadataFactory.Create(\"{methodSymbol.Name}\", __classType, typeof({returnType}), __classMetadata");
 
@@ -4768,8 +6119,8 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                     }
 
                     // Validate constraints for both class and method separately
-                    var constraintsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypes) &&
-                                          ValidateTypeConstraints(testMethod.MethodSymbol, methodTypes);
+                    var constraintsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypes, testMethod.CompilationContext.Compilation) &&
+                                          ValidateTypeConstraints(testMethod.MethodSymbol, methodTypes, testMethod.CompilationContext.Compilation, testMethod.TypeSymbol, classTypes);
 
                     if (!constraintsValid)
                     {
@@ -4827,12 +6178,12 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                     if (testMethod is { IsGenericType: true, IsGenericMethod: false })
                     {
                         // For generic class only, validate class constraints
-                        constraintsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, inferredTypes);
+                        constraintsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, inferredTypes, testMethod.CompilationContext.Compilation);
                     }
                     else if (testMethod.IsGenericMethod)
                     {
                         // For generic method (with or without generic class), validate method constraints
-                        constraintsValid = ValidateTypeConstraints(testMethod.MethodSymbol, inferredTypes);
+                        constraintsValid = ValidateTypeConstraints(testMethod.MethodSymbol, inferredTypes, testMethod.CompilationContext.Compilation);
                     }
 
                     if (!constraintsValid)
@@ -4854,7 +6205,8 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         {
             foreach (var methodArgAttr in methodArgumentsAttributes)
             {
-                var inferredTypes = InferClassTypesFromMethodArguments(testMethod.TypeSymbol, testMethod.MethodSymbol, methodArgAttr, compilation);
+                var inferredTypes = InferClassTypesFromMethodArguments(testMethod.TypeSymbol, testMethod.MethodSymbol, methodArgAttr, compilation,
+                    nullArgumentsArrayInfersObject: false);
                 if (inferredTypes is { Length: > 0 })
                 {
                     var typeKey = BuildTypeKey(inferredTypes);
@@ -4866,7 +6218,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                     }
 
                     // Validate class type constraints
-                    var constraintsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, inferredTypes);
+                    var constraintsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, inferredTypes, testMethod.CompilationContext.Compilation);
 
                     if (!constraintsValid)
                     {
@@ -4903,12 +6255,12 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 if (testMethod is { IsGenericType: true, IsGenericMethod: false })
                 {
                     // For generic class only, validate class constraints
-                    constraintsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, inferredTypes);
+                    constraintsValid = ValidateClassTypeConstraints(testMethod.TypeSymbol, inferredTypes, testMethod.CompilationContext.Compilation);
                 }
                 else if (testMethod.IsGenericMethod)
                 {
                     // For generic method (with or without generic class), validate method constraints
-                    constraintsValid = ValidateTypeConstraints(testMethod.MethodSymbol, inferredTypes);
+                    constraintsValid = ValidateTypeConstraints(testMethod.MethodSymbol, inferredTypes, testMethod.CompilationContext.Compilation);
                 }
 
                 if (!constraintsValid)
@@ -4935,7 +6287,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 if (processedTypeCombinations.Add(typeKey))
                 {
                     // Validate constraints
-                    if (ValidateTypeConstraints(testMethod.MethodSymbol, inferredTypes))
+                    if (ValidateTypeConstraints(testMethod.MethodSymbol, inferredTypes, testMethod.CompilationContext.Compilation))
                     {
                         // Generate a concrete instantiation for this type combination
                         writer.AppendLine($"[{string.Join(" + \",\" + ", inferredTypes.Select(FormatTypeForRuntimeName))}] = ");
@@ -4964,7 +6316,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                     if (processedTypeCombinations.Add(typeKey))
                     {
                         // Validate constraints for the generic class
-                        if (ValidateClassTypeConstraints(testMethod.TypeSymbol, inferredTypes))
+                        if (ValidateClassTypeConstraints(testMethod.TypeSymbol, inferredTypes, testMethod.CompilationContext.Compilation))
                         {
                             // Generate a concrete instantiation for this type combination
                             writer.AppendLine($"[{string.Join(" + \",\" + ", inferredTypes.Select(FormatTypeForRuntimeName))}] = ");
@@ -4988,7 +6340,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 if (processedTypeCombinations.Add(typeKey))
                 {
                     // Validate constraints for the generic class
-                    if (ValidateClassTypeConstraints(testMethod.TypeSymbol, typedDataSourceInferredTypes))
+                    if (ValidateClassTypeConstraints(testMethod.TypeSymbol, typedDataSourceInferredTypes, testMethod.CompilationContext.Compilation))
                     {
                         // Generate a concrete instantiation for this type combination
                         writer.AppendLine($"[{string.Join(" + \",\" + ", typedDataSourceInferredTypes.Select(FormatTypeForRuntimeName))}] = ");
@@ -5017,7 +6369,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                     if (processedTypeCombinations.Add(typeKey))
                     {
                         // Validate constraints
-                        if (ValidateTypeConstraints(testMethod.MethodSymbol, inferredTypes))
+                        if (ValidateTypeConstraints(testMethod.MethodSymbol, inferredTypes, testMethod.CompilationContext.Compilation))
                         {
                             // Generate a concrete instantiation for this type combination
                             writer.AppendLine($"[{string.Join(" + \",\" + ", inferredTypes.Select(FormatTypeForRuntimeName))}] = ");
@@ -5061,8 +6413,8 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                                 if (processedTypeCombinations.Add(typeKey))
                                 {
                                     // Validate constraints for both class and method type parameters
-                                    if (ValidateClassTypeConstraints(testMethod.TypeSymbol, classInferredTypes) &&
-                                        ValidateTypeConstraints(testMethod.MethodSymbol, methodInferredTypes))
+                                    if (ValidateClassTypeConstraints(testMethod.TypeSymbol, classInferredTypes, testMethod.CompilationContext.Compilation) &&
+                                        ValidateTypeConstraints(testMethod.MethodSymbol, methodInferredTypes, testMethod.CompilationContext.Compilation, testMethod.TypeSymbol, classInferredTypes))
                                     {
                                         // Generate a concrete instantiation for this type combination
                                         writer.AppendLine($"[{string.Join(" + \",\" + ", combinedTypes.Select(FormatTypeForRuntimeName))}] = ");
@@ -5082,7 +6434,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                         if (processedTypeCombinations.Add(typeKey))
                         {
                             // Validate constraints for the generic class type parameters
-                            if (ValidateClassTypeConstraints(testMethod.TypeSymbol, classInferredTypes))
+                            if (ValidateClassTypeConstraints(testMethod.TypeSymbol, classInferredTypes, testMethod.CompilationContext.Compilation))
                             {
                                 // Generate a concrete instantiation for this type combination
                                 writer.AppendLine($"[{string.Join(" + \",\" + ", classInferredTypes.Select(FormatTypeForRuntimeName))}] = ");
@@ -5185,8 +6537,8 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 foreach (var methodTypeArgs in methodTypeArgSets)
                 {
                     // Validate both class and method constraints
-                    if (ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypeArgs) &&
-                        ValidateTypeConstraints(testMethod.MethodSymbol, methodTypeArgs))
+                    if (ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypeArgs, testMethod.CompilationContext.Compilation) &&
+                        ValidateTypeConstraints(testMethod.MethodSymbol, methodTypeArgs, testMethod.CompilationContext.Compilation, testMethod.TypeSymbol, classTypeArgs))
                     {
                         // Combine class + method type arguments
                         var combinedTypes = classTypeArgs.Concat(methodTypeArgs).ToArray();
@@ -5207,7 +6559,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             // Only class is generic
             foreach (var classTypeArgs in classTypeArgSets)
             {
-                if (ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypeArgs))
+                if (ValidateClassTypeConstraints(testMethod.TypeSymbol, classTypeArgs, testMethod.CompilationContext.Compilation))
                 {
                     var typeKey = BuildTypeKey(classTypeArgs);
                     if (processedTypeCombinations.Add(typeKey))
@@ -5224,7 +6576,7 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             // Only method is generic
             foreach (var methodTypeArgs in methodTypeArgSets)
             {
-                if (ValidateTypeConstraints(testMethod.MethodSymbol, methodTypeArgs))
+                if (ValidateTypeConstraints(testMethod.MethodSymbol, methodTypeArgs, testMethod.CompilationContext.Compilation))
                 {
                     var typeKey = BuildTypeKey(methodTypeArgs);
                     if (processedTypeCombinations.Add(typeKey))
@@ -5286,79 +6638,26 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         return result;
     }
 
-    private static bool ValidateClassTypeConstraints(INamedTypeSymbol classSymbol, ITypeSymbol[] typeArguments)
+    private static bool ValidateClassTypeConstraints(INamedTypeSymbol classSymbol, ITypeSymbol[] typeArguments, Compilation compilation)
     {
         var typeParams = classSymbol.TypeParameters;
 
-        if (typeParams.Length != typeArguments.Length)
-        {
-            return false;
-        }
-
-        for (var i = 0; i < typeParams.Length; i++)
-        {
-            var typeParam = typeParams[i];
-            var typeArg = typeArguments[i];
-
-            // Check struct constraint
-            if (typeParam.HasValueTypeConstraint)
-            {
-                if (!typeArg.IsValueType || typeArg.IsReferenceType)
-                {
-                    return false;
-                }
-            }
-
-            // Check class constraint
-            if (typeParam.HasReferenceTypeConstraint)
-            {
-                if (!typeArg.IsReferenceType)
-                {
-                    return false;
-                }
-            }
-
-            // Check specific type constraints
-            foreach (var constraintType in typeParam.ConstraintTypes)
-            {
-                // Substitute type parameters in the constraint type with the actual type arguments
-                var substitutedConstraint = SubstituteTypeParameters(constraintType, typeParams, typeArguments);
-
-                // For interface constraints, check if the type implements the interface
-                if (substitutedConstraint.TypeKind == TypeKind.Interface)
-                {
-                    if (!TypeImplementsInterface(typeArg, substitutedConstraint))
-                    {
-                        return false;
-                    }
-                }
-                // For base class constraints, check if the type derives from the class
-                else if (substitutedConstraint.TypeKind == TypeKind.Class)
-                {
-                    var baseType = typeArg.BaseType;
-                    var found = false;
-                    while (baseType != null)
-                    {
-                        if (SymbolEqualityComparer.Default.Equals(baseType, substitutedConstraint))
-                        {
-                            found = true;
-                            break;
-                        }
-                        baseType = baseType.BaseType;
-                    }
-                    if (!found && !SymbolEqualityComparer.Default.Equals(typeArg, substitutedConstraint))
-                    {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        return true;
+        return typeParams.Length == typeArguments.Length
+            && !HasConstraintViolation(typeParams, typeArguments, compilation);
     }
 
-    private static ITypeSymbol SubstituteTypeParameters(ITypeSymbol type, ImmutableArray<ITypeParameterSymbol> typeParams, ITypeSymbol[] typeArguments)
+    private static ITypeSymbol SubstituteTypeParameters(ITypeSymbol type, ImmutableArray<ITypeParameterSymbol> typeParams, ITypeSymbol[] typeArguments, Compilation? compilation = null)
     {
+        // An array of a type parameter (e.g. the U[] in IEnumerable<U[]>): substitute the element type.
+        // Building the new array type needs the compilation.
+        if (type is IArrayTypeSymbol arrayType && compilation != null)
+        {
+            var substitutedElement = SubstituteTypeParameters(arrayType.ElementType, typeParams, typeArguments, compilation);
+            return SymbolEqualityComparer.Default.Equals(substitutedElement, arrayType.ElementType)
+                ? type
+                : compilation.CreateArrayTypeSymbol(substitutedElement, arrayType.Rank);
+        }
+
         // If the type is a type parameter, substitute it with the corresponding type argument
         if (type is ITypeParameterSymbol typeParam)
         {
@@ -5372,8 +6671,10 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             return type;
         }
 
-        // If the type is a named type with type arguments (e.g., IComparable<T>), substitute recursively
-        if (type is INamedTypeSymbol { IsGenericType: true } namedType)
+        // If the type is a named type with type arguments (e.g., IComparable<T>), substitute recursively.
+        // A nested type's TypeArguments are only its own, so its containing type (the Outer<U> of
+        // Outer<U>.IOut<string>) is substituted separately.
+        if (type is INamedTypeSymbol namedType)
         {
             var originalTypeArgs = namedType.TypeArguments;
             var newTypeArgs = new ITypeSymbol[originalTypeArgs.Length];
@@ -5381,44 +6682,120 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
 
             for (var i = 0; i < originalTypeArgs.Length; i++)
             {
-                newTypeArgs[i] = SubstituteTypeParameters(originalTypeArgs[i], typeParams, typeArguments);
+                newTypeArgs[i] = SubstituteTypeParameters(originalTypeArgs[i], typeParams, typeArguments, compilation);
                 if (!SymbolEqualityComparer.Default.Equals(newTypeArgs[i], originalTypeArgs[i]))
                 {
                     anyChanged = true;
                 }
             }
 
+            if (namedType.ContainingType is { } containingType
+                && SubstituteTypeParameters(containingType, typeParams, typeArguments, compilation) is INamedTypeSymbol substitutedContaining
+                && !SymbolEqualityComparer.Default.Equals(substitutedContaining, containingType))
+            {
+                foreach (var member in substitutedContaining.GetTypeMembers(namedType.Name, namedType.Arity))
+                {
+                    if (SymbolEqualityComparer.Default.Equals(member.OriginalDefinition, namedType.OriginalDefinition))
+                    {
+                        return namedType.Arity > 0 ? member.Construct(newTypeArgs) : member;
+                    }
+                }
+
+                return type;
+            }
+
             if (anyChanged)
             {
-                return namedType.OriginalDefinition.Construct(newTypeArgs);
+                // ConstructedFrom keeps the containing type's type arguments.
+                return namedType.ConstructedFrom.Construct(newTypeArgs);
             }
         }
 
         return type;
     }
 
-    private static bool TypeImplementsInterface(ITypeSymbol type, ITypeSymbol interfaceType)
+    /// <summary>
+    /// Whether <paramref name="type"/> satisfies the base type or interface constraint
+    /// <paramref name="constraint"/> under C# rules: an identity, implicit reference or boxing
+    /// conversion. This accepts variant interfaces (for example, <c>List&lt;string&gt;</c> for
+    /// <c>IEnumerable&lt;object&gt;</c>), as C# and reflection's <c>IsAssignableFrom</c> do.
+    /// </summary>
+    private static bool SatisfiesTypeConstraint(ITypeSymbol type, ITypeSymbol constraint, Compilation compilation)
     {
-        // Check if the type directly implements the interface
-        if (type.AllInterfaces.Any(i => SymbolEqualityComparer.Default.Equals(i, interfaceType)))
+        if (SymbolEqualityComparer.Default.Equals(type, constraint))
         {
             return true;
         }
 
-        // For generic interfaces, also check if the type implements a constructed version
-        if (interfaceType is INamedTypeSymbol { IsGenericType: true } genericInterface)
+        // A constraint accepts a boxing conversion only from a non-nullable value type: int? boxes to
+        // IComparable, but Run<int?>() with 'where T : IComparable' is CS0313, and reflection mode rejects it too.
+        var isNullableValueType = type.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T;
+
+        if (compilation is CSharpCompilation csharpCompilation)
         {
-            var originalDef = genericInterface.OriginalDefinition;
-            return type.AllInterfaces.Any(i =>
-                i.IsGenericType &&
-                SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, originalDef) &&
-                ((IEnumerable<ITypeSymbol>)i.TypeArguments).SequenceEqual(genericInterface.TypeArguments, SymbolEqualityComparer.Default));
+            var conversion = csharpCompilation.ClassifyConversion(type, constraint);
+            return conversion.Exists
+                && conversion.IsImplicit
+                && (conversion.IsIdentity || conversion.IsReference || (conversion.IsBoxing && !isNullableValueType));
         }
 
-        return false;
+        var commonConversion = compilation.ClassifyCommonConversion(type, constraint);
+        return commonConversion.Exists
+            && commonConversion.IsImplicit
+            && !commonConversion.IsUserDefined
+            && (commonConversion.IsIdentity || commonConversion.IsReference || (type.IsValueType && !isNullableValueType && !constraint.IsValueType));
     }
 
-    private static ITypeSymbol[]? InferClassTypesFromMethodArguments(INamedTypeSymbol classSymbol, IMethodSymbol methodSymbol, AttributeData argAttr, Compilation compilation)
+    /// <summary>
+    /// Whether a row's inferred type arguments are <paramref name="expected"/>. A row whose types
+    /// cannot be inferred is kept, as before.
+    /// </summary>
+    private static bool InferredTypesMatch(ITypeSymbol[]? inferred, ITypeSymbol[] expected)
+    {
+        if (inferred is not { Length: > 0 })
+        {
+            return true;
+        }
+
+        return ((IEnumerable<ITypeSymbol>)inferred).SequenceEqual(expected, SymbolEqualityComparer.Default);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="type"/> satisfies a <c>new()</c> constraint: a value type, or a
+    /// non-abstract class with a public parameterless constructor.
+    /// </summary>
+    private static bool SatisfiesConstructorConstraint(ITypeSymbol type)
+    {
+        if (type.IsValueType)
+        {
+            return true;
+        }
+
+        return type is INamedTypeSymbol { IsAbstract: false, TypeKind: TypeKind.Class } named
+            && named.InstanceConstructors.Any(static c => c.Parameters.Length == 0 && c.DeclaredAccessibility == Accessibility.Public);
+    }
+
+    /// <summary>
+    /// True when an [Arguments] attribute carries its <c>params object?[]</c> constructor argument as an array.
+    /// A typed <c>[Arguments&lt;T[]&gt;]</c> row also has one array constructor argument, but it is a single
+    /// <c>T[]</c> value whose type the typed-row inference reads, so it is excluded.
+    /// </summary>
+    private static bool HasArgumentsArray(AttributeData argAttr) =>
+        argAttr.AttributeClass is { IsGenericType: false }
+        && argAttr.ConstructorArguments is [{ Kind: TypedConstantKind.Array }];
+
+    /// <summary>
+    /// True for <c>[Arguments(null)]</c>: a null params array, which ArgumentsAttribute stores as one null value.
+    /// Call only after <see cref="HasArgumentsArray"/> returns true.
+    /// </summary>
+    private static bool IsNullArgumentsArray(AttributeData argAttr) => argAttr.ConstructorArguments[0].IsNull;
+
+    /// <param name="nullArgumentsArrayInfersObject">
+    /// False when [GenerateGenericTest] or a class-level data source supplies the class type arguments: an
+    /// [Arguments(null)] row then infers no type and runs on those instantiations. True otherwise, so the
+    /// row's one null value infers object like any other null value instead of being dropped (#7141).
+    /// </param>
+    private static ITypeSymbol[]? InferClassTypesFromMethodArguments(INamedTypeSymbol classSymbol, IMethodSymbol methodSymbol, AttributeData argAttr, Compilation compilation, bool nullArgumentsArrayInfersObject)
     {
         if (argAttr.ConstructorArguments.Length == 0)
         {
@@ -5428,26 +6805,38 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         var inferredTypes = new Dictionary<string, ITypeSymbol>();
         var classTypeParameters = classSymbol.TypeParameters;
 
-        // Arguments attribute takes params object?[] so the first constructor argument is an array
-        if (argAttr.ConstructorArguments.Length != 1 || argAttr.ConstructorArguments[0].Kind != TypedConstantKind.Array)
+        if (!HasArgumentsArray(argAttr))
         {
             return null;
         }
 
+        // [Arguments(null)] passes a null array, which ArgumentsAttribute stores as one null value (as in reflection mode)
+        if (IsNullArgumentsArray(argAttr))
+        {
+            if (nullArgumentsArrayInfersObject
+                && classTypeParameters.Length == 1
+                && GetDataParameters(methodSymbol) is [var firstDataParameter, ..]
+                // A by-reference parameter cannot be passed the row's value, and reflection mode infers
+                // nothing for it (its type is T&, not T), so the row stays without an instantiation.
+                && firstDataParameter.RefKind == RefKind.None
+                && firstDataParameter.Type is ITypeParameterSymbol { DeclaringMethod: null } nullTypeParam
+                && SymbolEqualityComparer.Default.Equals(nullTypeParam, classTypeParameters[0]))
+            {
+                return [compilation.GetSpecialType(SpecialType.System_Object)];
+            }
+
+            return null;
+        }
+
         var argumentValues = argAttr.ConstructorArguments[0].Values;
-        var methodParams = methodSymbol.Parameters;
+        // The engine supplies CancellationToken parameters, so the row's values bind to the others.
+        var methodParams = GetDataParameters(methodSymbol);
 
         // For each value in the params array
         for (var argIndex = 0; argIndex < argumentValues.Length && argIndex < methodParams.Length; argIndex++)
         {
             var methodParam = methodParams[argIndex];
             var argValue = argumentValues[argIndex];
-
-            // Skip if this is a CancellationToken parameter
-            if (methodParam.Type.Name == "CancellationToken")
-            {
-                continue;
-            }
 
             // Check if the method parameter type is a class generic type parameter
             if (methodParam.Type is ITypeParameterSymbol { DeclaringMethod: null } typeParam)
@@ -5522,6 +6911,11 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             return namedType.TypeArguments.Any(ta => ContainsClassTypeParameter(ta, classSymbol));
         }
 
+        if (type is IArrayTypeSymbol arrayType)
+        {
+            return ContainsClassTypeParameter(arrayType.ElementType, classSymbol);
+        }
+
         return false;
     }
 
@@ -5534,15 +6928,30 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 inferredTypes[typeParam.Name] = argType;
             }
         }
-        else if (paramType is INamedTypeSymbol paramNamedType && argType is INamedTypeSymbol argNamedType &&
-                 paramNamedType.IsGenericType && argNamedType.IsGenericType &&
-                 paramNamedType.OriginalDefinition.Equals(argNamedType.OriginalDefinition, SymbolEqualityComparer.Default))
+        else if (paramType is INamedTypeSymbol { IsGenericType: true } paramNamedType)
         {
+            // The argument's own type when it matches, else an interface it implements (e.g. IEnumerable<T>
+            // given a string[]), as reflection mode's InferGenericTypeMapping does
+            var argNamedType = argType is INamedTypeSymbol { IsGenericType: true } named
+                               && SymbolEqualityComparer.Default.Equals(named.OriginalDefinition, paramNamedType.OriginalDefinition)
+                ? named
+                : argType.AllInterfaces.FirstOrDefault(i => SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, paramNamedType.OriginalDefinition));
+
+            if (argNamedType == null)
+            {
+                return;
+            }
+
             // Map type arguments recursively
             for (var i = 0; i < paramNamedType.TypeArguments.Length && i < argNamedType.TypeArguments.Length; i++)
             {
                 MapGenericTypeArguments(paramNamedType.TypeArguments[i], argNamedType.TypeArguments[i], inferredTypes);
             }
+        }
+        // T[] given an array infers T from its element type, as in reflection mode
+        else if (paramType is IArrayTypeSymbol paramArrayType && argType is IArrayTypeSymbol argArrayType)
+        {
+            MapGenericTypeArguments(paramArrayType.ElementType, argArrayType.ElementType, inferredTypes);
         }
     }
 
@@ -5574,16 +6983,37 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         var inferredTypes = new Dictionary<string, ITypeSymbol>();
         var typeParameters = classSymbol.TypeParameters;
 
-        // Arguments attribute takes params object?[] so the first constructor argument is an array
-        if (argAttr.ConstructorArguments.Length != 1 || argAttr.ConstructorArguments[0].Kind != TypedConstantKind.Array)
+        ImmutableArray<TypedConstant> argumentValues;
+        // The declared type of an [Arguments<T>(null)] row, which its null value infers
+        ITypeSymbol? declaredNullValueType = null;
+        if (argAttr.AttributeClass is { IsGenericType: true, TypeArguments.Length: 1 } genericArgumentsAttribute)
+        {
+            // [Arguments<T>(value)] is a class row of one value, as reflection mode reads it. A null value
+            // infers the declared T, as reflection mode does.
+            if (argAttr.ConstructorArguments[0].IsNull)
+            {
+                declaredNullValueType = genericArgumentsAttribute.TypeArguments[0];
+            }
+
+            argumentValues = ImmutableArray.Create(argAttr.ConstructorArguments[0]);
+        }
+        // [Arguments(null)] passes one null value, from which no class type can be inferred (as in reflection mode)
+        else if (!HasArgumentsArray(argAttr) || IsNullArgumentsArray(argAttr))
         {
             return null;
         }
+        else
+        {
+            argumentValues = argAttr.ConstructorArguments[0].Values;
+        }
 
-        var argumentValues = argAttr.ConstructorArguments[0].Values;
-
-        // Find the primary constructor
-        var primaryConstructor = classSymbol.Constructors
+        // The row binds to the constructor the instance is built with: one marked [TestConstructor], as the instance
+        // factory reads it, and otherwise the primary constructor. Mirrors reflection mode's
+        // ReflectionGenericTypeResolver.InferTypeArgumentsFromConstructor.
+        var primaryConstructor = classSymbol.InstanceConstructors
+            .FirstOrDefault(c => c.GetAttributes().Any(attribute =>
+                attribute.AttributeClass?.ToDisplayString() == WellKnownFullyQualifiedClassNames.TestConstructorAttribute.WithoutGlobalPrefix))
+            ?? classSymbol.Constructors
             .FirstOrDefault(c => c.DeclaringSyntaxReferences.Any(sr =>
                 sr.GetSyntax() is ConstructorDeclarationSyntax cds &&
                 cds.Modifiers.Any(m => m.IsKind(SyntaxKind.PublicKeyword))))
@@ -5596,14 +7026,34 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
 
         var constructorParams = primaryConstructor.Parameters;
 
+        if (declaredNullValueType != null)
+        {
+            // The null value binds to the constructor's first parameter, so its declared type is mapped through
+            // that parameter's type: [Arguments<string[]>(null)] on C<T>(T[] values) infers T as string, as
+            // reflection mode infers it. A class with more than one type parameter cannot be inferred from one value.
+            if (typeParameters.Length != 1 || constructorParams.Length == 0)
+            {
+                return null;
+            }
+
+            var nullValueTypeArgument = MatchTypeParameter(constructorParams[0].Type, declaredNullValueType, typeParameters[0]);
+            return nullValueTypeArgument == null ? null : [nullValueTypeArgument];
+        }
+
+        // Type parameters inferred through a T[] or List<T> parameter, and bare type parameters bound by an untyped null
+        HashSet<string>? shapeInferredTypeParameters = null;
+        HashSet<string>? nullOnlyTypeParameters = null;
+
         // For each value in the params array
         for (var argIndex = 0; argIndex < argumentValues.Length && argIndex < constructorParams.Length; argIndex++)
         {
             var constructorParam = constructorParams[argIndex];
             var argValue = argumentValues[argIndex];
 
-            // Check if the constructor parameter type is a generic type parameter
-            if (constructorParam.Type is ITypeParameterSymbol typeParam)
+            // A value infers each type parameter its constructor parameter's type mentions, by matching the value's
+            // type against that parameter type: T takes the value's type, T[] its element type, and List<T> its type
+            // argument, as reflection mode infers them (#7223).
+            if (MentionsTypeParameter(constructorParam.Type))
             {
                 // The argument value's type tells us what the generic type should be
                 ITypeSymbol? argType = null;
@@ -5632,9 +7082,59 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                     };
                 }
 
+                // A null says nothing about T, even when it is cast, so a later value infers it, as reflection mode
+                // skips null values: [Arguments((int[])null!, "x")] on C<T>(T[]? values, T other) infers string. A
+                // bare T that only nulls bind still falls back to object below.
+                if (argValue.IsNull)
+                {
+                    if (constructorParam.Type is ITypeParameterSymbol nullTypeParam)
+                    {
+                        (nullOnlyTypeParameters ??= []).Add(nullTypeParam.Name);
+                    }
+
+                    argType = null;
+                }
+
                 if (argType != null)
                 {
-                    inferredTypes[typeParam.Name] = argType;
+                    if (constructorParam.Type is ITypeParameterSymbol typeParam)
+                    {
+                        // A bare T keeps its earlier rule, the last value's type: [Arguments(1, 2L)] on
+                        // C<T>(T first, T second) infers long, which both values bind to. A type that a T[] or
+                        // List<T> value inferred wins, because that value cannot bind to any other T.
+                        if (shapeInferredTypeParameters?.Contains(typeParam.Name) != true)
+                        {
+                            inferredTypes[typeParam.Name] = argType;
+                        }
+                    }
+                    else
+                    {
+                        // The first T[] or List<T> value fixes T, replacing a type a bare T inferred:
+                        // [Arguments((short)2, new[] { 1 })] on C<T>(T count, T[] values) infers int, which the
+                        // short also binds to.
+                        foreach (var typeParameter in typeParameters)
+                        {
+                            if (shapeInferredTypeParameters?.Contains(typeParameter.Name) != true
+                                && MatchTypeParameter(constructorParam.Type, argType, typeParameter) is { } typeArgument)
+                            {
+                                inferredTypes[typeParameter.Name] = typeArgument;
+                                (shapeInferredTypeParameters ??= []).Add(typeParameter.Name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // A bare T that only untyped nulls bind is object: [Arguments(null, null)] on C<T>(T first, T second) runs on
+        // C<object>, as before #7223
+        if (nullOnlyTypeParameters != null)
+        {
+            foreach (var name in nullOnlyTypeParameters)
+            {
+                if (!inferredTypes.ContainsKey(name))
+                {
+                    inferredTypes[name] = compilation.GetSpecialType(SpecialType.System_Object);
                 }
             }
         }
@@ -5660,6 +7160,53 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         return null;
     }
 
+    private static bool MentionsTypeParameter(ITypeSymbol type) => type switch
+    {
+        ITypeParameterSymbol => true,
+        IArrayTypeSymbol array => MentionsTypeParameter(array.ElementType),
+        INamedTypeSymbol named => named.TypeArguments.Any(MentionsTypeParameter),
+        _ => false
+    };
+
+    /// <summary>
+    /// The type that <paramref name="typeParameter"/> takes when a value of <paramref name="declaredType"/> binds to a
+    /// parameter of <paramref name="parameterType"/>: the declared type itself for a parameter of type T, its element
+    /// type for T[], and the matching type argument for a constructed generic such as List&lt;T&gt;. Null when the
+    /// parameter type does not mention the type parameter or the declared type does not have its shape. Reflection
+    /// mode maps the declared type of an [Arguments&lt;T&gt;(null)] class row the same way.
+    /// </summary>
+    private static ITypeSymbol? MatchTypeParameter(ITypeSymbol parameterType, ITypeSymbol declaredType, ITypeParameterSymbol typeParameter)
+    {
+        if (parameterType is ITypeParameterSymbol parameterTypeParameter)
+        {
+            return SymbolEqualityComparer.Default.Equals(parameterTypeParameter, typeParameter) ? declaredType : null;
+        }
+
+        if (parameterType is IArrayTypeSymbol parameterArray)
+        {
+            return declaredType is IArrayTypeSymbol declaredArray && declaredArray.Rank == parameterArray.Rank
+                ? MatchTypeParameter(parameterArray.ElementType, declaredArray.ElementType, typeParameter)
+                : null;
+        }
+
+        if (parameterType is INamedTypeSymbol { IsGenericType: true } parameterNamed
+            && declaredType is INamedTypeSymbol { IsGenericType: true } declaredNamed
+            && SymbolEqualityComparer.Default.Equals(parameterNamed.OriginalDefinition, declaredNamed.OriginalDefinition))
+        {
+            var parameterTypeArguments = parameterNamed.TypeArguments;
+            var declaredTypeArguments = declaredNamed.TypeArguments;
+            for (var i = 0; i < parameterTypeArguments.Length; i++)
+            {
+                if (MatchTypeParameter(parameterTypeArguments[i], declaredTypeArguments[i], typeParameter) is { } match)
+                {
+                    return match;
+                }
+            }
+        }
+
+        return null;
+    }
+
     private static ITypeSymbol[]? InferTypesFromArgumentsAttribute(IMethodSymbol method, AttributeData argAttr, Compilation compilation)
     {
         if (argAttr.ConstructorArguments.Length == 0)
@@ -5670,14 +7217,35 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         var inferredTypes = new Dictionary<string, ITypeSymbol>();
         var typeParameters = method.TypeParameters;
 
-        // Arguments attribute takes params object?[] so the first constructor argument is an array
-        if (argAttr.ConstructorArguments.Length != 1 || argAttr.ConstructorArguments[0].Kind != TypedConstantKind.Array)
+        if (!HasArgumentsArray(argAttr))
         {
             return null;
         }
 
+        // Row values bind to the data parameters only; the engine supplies the CancellationToken.
+        var methodParams = method.Parameters
+            .Where(p => !p.Type.IsCancellationToken())
+            .ToArray();
+
+        // [Arguments(null)] passes a null array, which ArgumentsAttribute stores as one null value. Like any
+        // other null element of the params object?[] argument, it infers object (as reflection mode does).
+        if (IsNullArgumentsArray(argAttr))
+        {
+            if (typeParameters.Length == 1
+                && methodParams.Length > 0
+                && methodParams[0].Type is ITypeParameterSymbol nullTypeParam
+                && SymbolEqualityComparer.Default.Equals(nullTypeParam, typeParameters[0]))
+            {
+                return [compilation.GetSpecialType(SpecialType.System_Object)];
+            }
+
+            return null;
+        }
+
         var argumentValues = argAttr.ConstructorArguments[0].Values;
-        var methodParams = method.Parameters;
+
+        // Method type parameters that received a null value, if any
+        HashSet<string>? nullTypeParameters = null;
 
         // For each value in the params array
         for (var argIndex = 0; argIndex < argumentValues.Length && argIndex < methodParams.Length; argIndex++)
@@ -5685,15 +7253,22 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             var methodParam = methodParams[argIndex];
             var argValue = argumentValues[argIndex];
 
-            // Skip if this is a CancellationToken parameter
-            if (methodParam.Type.Name == "CancellationToken")
-            {
-                continue;
-            }
-
             // Check if the method parameter type is a generic type parameter
             if (methodParam.Type is ITypeParameterSymbol typeParam)
             {
+                // A null value (typed object) infers object only when no other value infers the type
+                // parameter, so Run<T>(T first, T second) with [Arguments("a", null)] runs as Run<string>,
+                // as with [Arguments(null, "a")] and in reflection mode
+                if (argValue.IsNull)
+                {
+                    (nullTypeParameters ??= []).Add(typeParam.Name);
+
+                    if (inferredTypes.ContainsKey(typeParam.Name))
+                    {
+                        continue;
+                    }
+                }
+
                 // The argument value's type tells us what the generic type should be
                 // For literal values, we need to infer the type from the value itself
                 ITypeSymbol? argType = null;
@@ -5709,15 +7284,15 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
 
                     argType = value switch
                     {
-                        int => compilation?.GetSpecialType(SpecialType.System_Int32),
-                        string => compilation?.GetSpecialType(SpecialType.System_String),
-                        bool => compilation?.GetSpecialType(SpecialType.System_Boolean),
-                        double => compilation?.GetSpecialType(SpecialType.System_Double),
-                        float => compilation?.GetSpecialType(SpecialType.System_Single),
-                        long => compilation?.GetSpecialType(SpecialType.System_Int64),
-                        char => compilation?.GetSpecialType(SpecialType.System_Char),
-                        byte => compilation?.GetSpecialType(SpecialType.System_Byte),
-                        decimal => compilation?.GetSpecialType(SpecialType.System_Decimal),
+                        int => compilation.GetSpecialType(SpecialType.System_Int32),
+                        string => compilation.GetSpecialType(SpecialType.System_String),
+                        bool => compilation.GetSpecialType(SpecialType.System_Boolean),
+                        double => compilation.GetSpecialType(SpecialType.System_Double),
+                        float => compilation.GetSpecialType(SpecialType.System_Single),
+                        long => compilation.GetSpecialType(SpecialType.System_Int64),
+                        char => compilation.GetSpecialType(SpecialType.System_Char),
+                        byte => compilation.GetSpecialType(SpecialType.System_Byte),
+                        decimal => compilation.GetSpecialType(SpecialType.System_Decimal),
                         _ => argType
                     };
                 }
@@ -5725,6 +7300,34 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 if (argType != null)
                 {
                     inferredTypes[typeParam.Name] = argType;
+                }
+            }
+            // A lone array value for a trailing params T[] or plain T[] (e.g. [Arguments(new[] { 1, 2 })])
+            // is the array itself, so T is its element type. Loose values are not used to infer T:
+            // reflection mode cannot bind them yet (https://github.com/thomhurst/TUnit/issues/7099).
+            else if (argIndex == methodParams.Length - 1
+                     && argumentValues.Length == methodParams.Length
+                     && methodParam.CollectsTrailingArguments()
+                     && methodParam.Type is IArrayTypeSymbol { IsSZArray: true, ElementType: ITypeParameterSymbol elementTypeParam }
+                     && !inferredTypes.ContainsKey(elementTypeParam.Name)
+                     && argValue is { Kind: TypedConstantKind.Array, Type: IArrayTypeSymbol { ElementType: var elementType } })
+            {
+                inferredTypes[elementTypeParam.Name] = elementType;
+            }
+        }
+
+        // A null value cannot be passed as a non-nullable value type, so a type parameter that received both
+        // null and, say, 1 infers object: [Arguments(1, null)] runs as Run<object>(1, null), in either order
+        // and in reflection mode, instead of Run<int> with the null turned into 0 (#7155)
+        if (nullTypeParameters is not null)
+        {
+            foreach (var nullTypeParameter in nullTypeParameters)
+            {
+                if (inferredTypes.TryGetValue(nullTypeParameter, out var inferredType)
+                    && inferredType.IsValueType
+                    && inferredType.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T)
+                {
+                    inferredTypes[nullTypeParameter] = compilation.GetSpecialType(SpecialType.System_Object);
                 }
             }
         }
@@ -5758,8 +7361,15 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             return null;
         }
 
+        // A generic method on a non-generic class uses the rules shared with analyzer TUnit0001.
+        if (method.IsGenericMethod && !method.ContainingType.IsGenericType)
+        {
+            return TypedDataSourceInference.InferMethodTypeArguments(attrClass, method);
+        }
+
         // Check if it's a typed data source by examining its base types
         var baseType = attrClass.BaseType;
+        var hasGeneratorBase = false;
         while (baseType != null)
         {
             if (baseType.IsGenericType)
@@ -5768,42 +7378,25 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 var baseTypeName = baseTypeDef.Name;
                 var baseTypeNamespace = baseTypeDef.ContainingNamespace?.ToDisplayString();
 
+                // A generic method takes its type arguments from an [Arguments<T>] row by matching the row
+                // type against its parameters, as on a non-generic class (#7214). The class type arguments
+                // come from the class's own sources.
+                if (!hasGeneratorBase && method.IsGenericMethod && TypedDataSourceInference.IsTypedRowBase(baseType))
+                {
+                    return TypedDataSourceInference.InferMethodTypeArgumentsFromRowType(method, baseType.TypeArguments[0]);
+                }
+
                 // Check for typed data source base classes more precisely
                 if (baseTypeName is "DataSourceGeneratorAttribute" or "AsyncDataSourceGeneratorAttribute" &&
                     baseTypeNamespace?.Contains("TUnit.Core") == true)
                 {
+                    hasGeneratorBase = true;
+
                     // Get the type arguments from the base class
                     var typeArgs = baseType.TypeArguments;
 
-                    // For generic method inference
-                    if (method.IsGenericMethod && !method.ContainingType.IsGenericType)
-                    {
-                        // Single type parameter method
-                        if (method.TypeParameters.Length == 1 && typeArgs.Length >= 1)
-                        {
-                            return new[] { typeArgs[0] };
-                        }
-
-                        // Multiple type parameters - check for tuple
-                        if (typeArgs is
-                            [
-                                INamedTypeSymbol { IsTupleType: true } tupleType
-                            ])
-                        {
-                            if (tupleType.TupleElements.Length == method.TypeParameters.Length)
-                            {
-                                return tupleType.TupleElements.Select(e => e.Type).ToArray();
-                            }
-                        }
-
-                        // Direct match for multiple type args
-                        if (typeArgs.Length == method.TypeParameters.Length)
-                        {
-                            return typeArgs.ToArray();
-                        }
-                    }
                     // For generic class inference (non-generic method)
-                    else if (!method.IsGenericMethod && method.ContainingType.IsGenericType)
+                    if (!method.IsGenericMethod && method.ContainingType.IsGenericType)
                     {
                         var classTypeParams = method.ContainingType.TypeParameters;
 
@@ -5853,6 +7446,10 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                         {
                             return typeArgs.ToArray();
                         }
+
+                        // Otherwise the method type arguments alone, as on a non-generic class (#7164).
+                        // Reflection mode's InferTypesFromTypedDataSource applies the same rules.
+                        return TypedDataSourceInference.InferMethodTypeArguments(method, typeArgs);
                     }
                 }
             }
@@ -5862,71 +7459,237 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         return null;
     }
 
+    /// <summary>
+    /// Infers a generic test method's type arguments from a [MethodDataSource] member's declared row type. Returns
+    /// null when the row type does not determine them, or when one of them is a type the generated code cannot name,
+    /// such as a private nested row class read through a private property: closing the method over it would not
+    /// compile. <see cref="AddUninferredTypeArgumentFailures"/> then reports the rows as failed tests.
+    /// </summary>
     private static ITypeSymbol[]? InferTypesFromMethodDataSource(TestMethodMetadata testMethod, AttributeData mdsAttr)
+    {
+        var inferredTypes = InferTypesFromMethodDataSourceRowType(testMethod, mdsAttr);
+        return inferredTypes != null && FindInaccessibleType(inferredTypes, testMethod.CompilationContext.Compilation) == null
+            ? inferredTypes
+            : null;
+    }
+
+    /// <summary>
+    /// The first of <paramref name="types"/> that generated code in the test assembly cannot name, or null.
+    /// Accessibility of a constructed or array type includes its type arguments and element type.
+    /// </summary>
+    private static ITypeSymbol? FindInaccessibleType(ITypeSymbol[] types, Compilation compilation)
+    {
+        foreach (var type in types)
+        {
+            if (type is not ITypeParameterSymbol && !compilation.IsSymbolAccessibleWithin(type, compilation.Assembly))
+            {
+                return type;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The class-level [MethodDataSource] attributes of a generic test class that name a member of the class itself
+    /// (no class given) and whose rows belong on the instantiation with <paramref name="classTypeArgs"/>: those whose
+    /// declared rows infer no types, because they name the class's type parameters (<c>IEnumerable&lt;T&gt;</c>) or
+    /// their types are only known at run time (<c>object</c>, <c>object[]</c>, a non-generic <c>IEnumerable</c>, or a
+    /// tuple such as <c>(object, string)</c> whose generic constructor column is <c>object</c>),
+    /// so only the class's [GenerateGenericTest] types can close the class those members are read on; and those whose
+    /// declared rows infer exactly these types through the constructor (<c>IEnumerable&lt;int&gt;</c> on
+    /// <c>C&lt;T&gt;(T value)</c> for <c>C&lt;int&gt;</c>). Reflection mode groups both the same way (#7208).
+    /// With <paramref name="includeUninferred"/> false, only the members whose declared rows infer these types.
+    /// </summary>
+    private static IEnumerable<AttributeData> GetOwnClassMethodDataSourcesForInstantiation(TestMethodMetadata testMethod, ITypeSymbol[] classTypeArgs, bool includeUninferred = true)
+    {
+        var compilation = testMethod.CompilationContext.Compilation;
+        foreach (var attribute in testMethod.TypeSymbol.GetAttributes())
+        {
+            if (attribute.AttributeClass is not { Name: "MethodDataSourceAttribute", IsGenericType: false }
+                || attribute.ConstructorArguments is not [{ Value: string memberName }])
+            {
+                continue;
+            }
+
+            var member = ResolveMethodDataSourceMember(testMethod.TypeSymbol, memberName, attribute, compilation);
+            if (member == null)
+            {
+                continue;
+            }
+
+            // Like reflection mode, a member whose declared rows infer no types through the constructor belongs on
+            // every [GenerateGenericTest] instantiation, whatever the row's shape: IEnumerable<T>, object[], or a
+            // tuple whose generic constructor column is declared as object, such as (object, string). A row that
+            // names T in one column can still infer it from another: (int, T) on C<T>(T first, T second) infers int.
+            var rowType = GetMethodDataSourceRowType(member, testMethod.CompilationContext.MethodDataSourceRowTypes, compilation);
+            var inferred = rowType == null
+                ? null
+                : InferClassTypesFromOwnMemberRowType(testMethod.TypeSymbol, rowType);
+            if (inferred == null ? includeUninferred : inferred.SequenceEqual(classTypeArgs, SymbolEqualityComparer.Default))
+            {
+                yield return attribute;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The class type arguments that the declared row type of an own-class [MethodDataSource] member infers, by
+    /// matching the row's elements against the parameters of the constructor the instance is built with: the one
+    /// marked <c>[TestConstructor]</c>, the first public one, or, when the class has a parameterless constructor
+    /// (which ignores the rows), the first public one that infers every type argument. A tuple row fills a
+    /// constructor's single tuple parameter whole. Null when a type argument stays unknown or would be
+    /// <c>object</c>. Mirrors reflection mode's <c>InferClassTypeArgumentsFromOwnMemberRowType</c> (#7208).
+    /// </summary>
+    private static ITypeSymbol[]? InferClassTypesFromOwnMemberRowType(INamedTypeSymbol classSymbol, ITypeSymbol rowType)
+    {
+        var constructors = classSymbol.InstanceConstructors
+            .Where(constructor => constructor.DeclaredAccessibility == Accessibility.Public)
+            .ToArray();
+
+        // A [TestConstructor] names the constructor the rows are for, as the instance factory reads it
+        var testConstructor = constructors.FirstOrDefault(constructor => constructor.GetAttributes().Any(attribute =>
+            attribute.AttributeClass?.ToDisplayString() == WellKnownFullyQualifiedClassNames.TestConstructorAttribute.WithoutGlobalPrefix));
+        if (testConstructor != null)
+        {
+            return InferClassTypesFromConstructorRow(testConstructor, rowType, classSymbol.TypeParameters);
+        }
+
+        if (constructors.Length > 0 && !constructors.Any(constructor => constructor.Parameters.Length == 0))
+        {
+            return InferClassTypesFromConstructorRow(constructors[0], rowType, classSymbol.TypeParameters);
+        }
+
+        foreach (var constructor in constructors)
+        {
+            if (InferClassTypesFromConstructorRow(constructor, rowType, classSymbol.TypeParameters) is { } typeArguments)
+            {
+                return typeArguments;
+            }
+        }
+
+        return null;
+    }
+
+    private static ITypeSymbol[]? InferClassTypesFromConstructorRow(IMethodSymbol constructor, ITypeSymbol rowType, ImmutableArray<ITypeParameterSymbol> typeParameters)
+    {
+        // A tuple row fills one tuple parameter whole, as the runtime passes it, and otherwise spreads one column
+        // per parameter. Like the runtime, which unwraps any ITuple, this treats a System.Tuple row as a value tuple one.
+        ITypeSymbol[] rowElements = (constructor.Parameters is not [{ Type: var single }] || GetTupleElementTypes(single) == null)
+            && GetTupleElementTypes(rowType) is { } tupleElements
+            ? tupleElements
+            : [rowType];
+        var typeArguments = new ITypeSymbol[typeParameters.Length];
+
+        for (var i = 0; i < typeParameters.Length; i++)
+        {
+            for (var j = 0; j < constructor.Parameters.Length && j < rowElements.Length && typeArguments[i] == null; j++)
+            {
+                if (rowElements[j].SpecialType != SpecialType.System_Object
+                    && MatchTypeParameter(constructor.Parameters[j].Type, rowElements[j], typeParameters[i]) is { } typeArgument
+                    && !CodeGenerationHelpers.ContainsTypeParameter(typeArgument)
+                    && typeArgument.SpecialType != SpecialType.System_Object)
+                {
+                    typeArguments[i] = typeArgument;
+                }
+            }
+
+            if (typeArguments[i] == null)
+            {
+                return null;
+            }
+        }
+
+        return typeArguments;
+    }
+
+    /// <summary>
+    /// The logical element types of a value tuple or <see cref="System.Tuple"/> type, or null for any other type.
+    /// Mirrors reflection mode's <c>GetTupleElementTypes</c>: a System.Tuple nests elements past the seventh in a
+    /// <c>TRest</c> System.Tuple.
+    /// </summary>
+    private static ITypeSymbol[]? GetTupleElementTypes(ITypeSymbol type)
+    {
+        if (type is not INamedTypeSymbol namedType)
+        {
+            return null;
+        }
+
+        if (namedType.IsTupleType)
+        {
+            return namedType.TupleElements.Select(element => element.Type).ToArray();
+        }
+
+        if (namedType is not { Name: "Tuple", Arity: >= 1 and <= 8, ContainingNamespace: { Name: "System", ContainingNamespace.IsGlobalNamespace: true } })
+        {
+            return null;
+        }
+
+        if (namedType.Arity < 8)
+        {
+            return namedType.TypeArguments.ToArray();
+        }
+
+        return GetTupleElementTypes(namedType.TypeArguments[7]) is { } rest
+            ? namedType.TypeArguments.Take(7).Concat(rest).ToArray()
+            : null;
+    }
+
+    private static ITypeSymbol[]? InferTypesFromMethodDataSourceRowType(TestMethodMetadata testMethod, AttributeData mdsAttr)
     {
         if (mdsAttr.ConstructorArguments.Length == 0)
         {
             return null;
         }
 
-        // Get the method name from the attribute
-        if (mdsAttr.ConstructorArguments[0].Value is not string methodName)
+        // [MethodDataSource("Rows")], [MethodDataSource(typeof(Provider), "Rows")] or [MethodDataSource<Provider>("Rows")]
+        INamedTypeSymbol providerType;
+        string methodName;
+        if (mdsAttr.ConstructorArguments is [{ Value: INamedTypeSymbol typeArgument }, { Value: string typedMethodName }])
+        {
+            providerType = typeArgument;
+            methodName = typedMethodName;
+        }
+        else if (mdsAttr.ConstructorArguments[0].Value is string attributeMethodName)
+        {
+            providerType = mdsAttr.AttributeClass is { IsGenericType: true, TypeArguments: [INamedTypeSymbol genericProvider] }
+                ? genericProvider
+                : testMethod.TypeSymbol;
+            methodName = attributeMethodName;
+        }
+        else
         {
             return null;
         }
 
-        // Find the method in the test class, or in T for [MethodDataSource<T>("Rows")]
-        var providerType = mdsAttr.AttributeClass is { IsGenericType: true, TypeArguments: [INamedTypeSymbol genericProvider] }
-            ? genericProvider
-            : testMethod.TypeSymbol;
-        var dataMethod = providerType.GetMembers(methodName)
-            .OfType<IMethodSymbol>()
-            .FirstOrDefault(m => m.IsStatic && m.Parameters.Length == 0);
-
-        if (dataMethod == null)
+        var compilation = testMethod.CompilationContext.Compilation;
+        var dataSourceMember = ResolveMethodDataSourceMember(providerType, methodName, mdsAttr, compilation);
+        var rowType = dataSourceMember == null ? null : GetMethodDataSourceRowType(dataSourceMember, testMethod.CompilationContext.MethodDataSourceRowTypes, compilation);
+        if (rowType == null)
         {
             return null;
         }
 
-        // Check if the method returns IEnumerable<Func<T>> where T is a tuple
-        var returnType = dataMethod.ReturnType;
-        if (returnType is not INamedTypeSymbol namedReturnType)
-        {
-            return null;
-        }
-
-        // Navigate through IEnumerable<Func<...>>
-        if (!namedReturnType.IsGenericType || namedReturnType.Name != "IEnumerable")
-        {
-            return null;
-        }
-
-        var funcType = namedReturnType.TypeArguments[0] as INamedTypeSymbol;
-        if (funcType == null || funcType.Name != "Func" || funcType.TypeArguments.Length != 1)
-        {
-            return null;
-        }
-
-        var tupleType = funcType.TypeArguments[0] as INamedTypeSymbol;
-        if (tupleType == null || !tupleType.IsTupleType)
-        {
-            return null;
-        }
-
-        // Extract the types from the tuple elements that correspond to the generic parameters
-        var testMethodParams = testMethod.MethodSymbol.Parameters;
+        // Row values bind to the data parameters only; the engine supplies the CancellationToken.
+        var testMethodParams = GetDataParameters(testMethod.MethodSymbol);
         var genericParams = testMethod.MethodSymbol.TypeParameters;
         var genericParamMap = new Dictionary<string, ITypeSymbol>();
 
-        // Map tuple elements to method parameters to infer types
-        var tupleElements = tupleType.TupleElements;
-        for (var i = 0; i < testMethodParams.Length && i < tupleElements.Length; i++)
+        if (rowType is INamedTypeSymbol { IsTupleType: true } tupleType
+            && !(testMethodParams.Length == 1 && testMethodParams[0].Type.IsTupleType))
         {
-            var paramType = testMethodParams[i].Type;
-            var tupleElementType = tupleElements[i].Type;
-
-            // Process the parameter type to find generic references
-            ProcessTypeForGenerics(paramType, tupleElementType, genericParams, genericParamMap);
+            // A tuple row is spread across the test method's parameters
+            var tupleElements = tupleType.TupleElements;
+            for (var i = 0; i < testMethodParams.Length && i < tupleElements.Length; i++)
+            {
+                ProcessTypeForGenerics(testMethodParams[i].Type, tupleElements[i].Type, genericParams, genericParamMap);
+            }
+        }
+        else if (testMethodParams.Length > 0)
+        {
+            // Any other row is a single value for the first parameter. This includes typed arrays
+            // such as int[]: only object[] rows are spread (DataSourceHelpers.ToObjectArray).
+            ProcessTypeForGenerics(testMethodParams[0].Type, rowType, genericParams, genericParamMap);
         }
 
         // Build the result array in the correct order
@@ -5941,6 +7704,500 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         }
 
         return inferredTypes;
+    }
+
+    /// <summary>
+    /// Builds the argument list for calling a [MethodDataSource] method with its <c>Arguments</c>, which the
+    /// generated factory holds in an <c>object[]</c> named <c>arguments</c>. It accepts what
+    /// <see cref="ScoreDataSourceOverload"/> accepts, as reflection mode's binder and <c>BuildInvokeArgs</c> do:
+    /// <list type="bullet">
+    /// <item>A value that needs a numeric or nullable conversion, such as an <c>int</c> passed to a <c>long</c>
+    /// parameter, is unboxed as its own type first. Casting the boxed value straight to the parameter type
+    /// would throw <see cref="InvalidCastException"/>.</item>
+    /// <item>A missing optional parameter is left out so its default applies, and a missing
+    /// <c>CancellationToken</c> gets <c>CancellationToken.None</c>. Later parameters are passed by name.</item>
+    /// </list>
+    /// A missing required parameter is only reached when no overload accepts the <c>Arguments</c>
+    /// (<see cref="ScoreDataSourceOverload"/> rejects such overloads, and TUnit0001 reports the mismatch at
+    /// compile time). The generated call then throws a descriptive <see cref="InvalidOperationException"/>
+    /// when the data source runs, instead of an <see cref="IndexOutOfRangeException"/>.
+    /// A required parameter can follow a skipped optional one only in that same case: C# requires every
+    /// parameter after an optional one to be optional or <c>params</c>, so a parameter after a skipped one
+    /// is itself missing.
+    /// When <paramref name="boundMethod"/> is set, <paramref name="method"/> is an override that the call binds to
+    /// through that base declaration. C# would then fill in the base's defaults, so the override's defaults are
+    /// passed explicitly, as reflection mode's <c>BuildInvokeArgs</c> reads them from the override. A default that
+    /// has no C# expression is still left out, named after the base declaration's parameter.
+    /// </summary>
+    private static string BuildDataSourceCallArguments(IMethodSymbol method, TypedConstant arguments, Compilation compilation, IMethodSymbol? boundMethod = null)
+    {
+        var values = arguments is { Kind: TypedConstantKind.Array, IsNull: false }
+            ? arguments.Values
+            : ImmutableArray<TypedConstant>.Empty;
+
+        var callArguments = new List<string>(method.Parameters.Length);
+        var useNames = false;
+        for (var i = 0; i < method.Parameters.Length; i++)
+        {
+            var parameter = method.Parameters[i];
+            var parameterType = parameter.Type.GloballyQualified();
+            string value;
+
+            if (i < values.Length)
+            {
+                var argumentType = values[i] is { IsNull: false, Type: { } type } ? type : null;
+                var conversion = argumentType == null || SymbolEqualityComparer.Default.Equals(argumentType, parameter.Type)
+                    ? default
+                    : compilation.ClassifyCommonConversion(argumentType, parameter.Type);
+
+                value = IsInvokeConversion(conversion, argumentType, parameter.Type) && (conversion.IsNumeric || conversion.IsNullable)
+                    ? $"(({parameterType})({argumentType!.GloballyQualified()})arguments[{i.ToString(CultureInfo.InvariantCulture)}])"
+                    : $"(({parameterType})arguments[{i.ToString(CultureInfo.InvariantCulture)}])";
+            }
+            else if (boundMethod != null && TupleArgumentHelper.TryFormatDefaultValue(parameter, out var defaultValue))
+            {
+                value = defaultValue;
+            }
+            else if (parameter.HasExplicitDefaultValue)
+            {
+                useNames = true;
+                continue;
+            }
+            else if (parameter.Type.IsCancellationToken())
+            {
+                value = "global::System.Threading.CancellationToken.None";
+            }
+            else
+            {
+                var message = $"[MethodDataSource] {method.ContainingType.Name}.{method.Name} needs a value for parameter '{parameter.Name}', "
+                    + $"but its Arguments supply {values.Length.ToString(CultureInfo.InvariantCulture)}. "
+                    + "Pass a value for every required parameter of the data method.";
+                value = $"(({parameterType})(arguments.Length > {i.ToString(CultureInfo.InvariantCulture)} ? arguments[{i.ToString(CultureInfo.InvariantCulture)}] "
+                    + $": throw new global::System.InvalidOperationException({SymbolDisplay.FormatLiteral(message, quote: true)})))";
+            }
+
+            var parameterName = boundMethod?.Parameters[i].Name ?? parameter.Name;
+            callArguments.Add(useNames ? $"@{parameterName}: {value}" : value);
+        }
+
+        return string.Join(", ", callArguments);
+    }
+
+    /// <summary>
+    /// Picks the member a [MethodDataSource] reads, mirroring reflection mode's
+    /// <c>MethodDataSourceAttribute.ResolveDataSourceMethod</c>: like <c>GetMethods</c> with
+    /// <c>FlattenHierarchy</c>, the methods of the target type and of every base type are candidates, except
+    /// private base members and base methods that a more derived type overrides or hides by signature.
+    /// The overload that accepts the attribute's <c>Arguments</c> wins (exact argument types over implicit
+    /// conversions); on an exact tie the most derived declaration wins, as with the reflection binder. When no
+    /// method applies, a property or field of the first type that declares the name is used. Both the
+    /// generated factory and generic type inference use this, so the closed test method always matches the
+    /// rows the factory produces. The factory calls a method through its declaring type, because C# overload
+    /// resolution on the target type would discard a base overload once a derived one is applicable
+    /// (https://github.com/thomhurst/TUnit/issues/7202).
+    /// </summary>
+    private static ISymbol? ResolveMethodDataSourceMember(ITypeSymbol targetType, string memberName, AttributeData attr, Compilation compilation)
+    {
+        var argumentsProperty = attr.NamedArguments.FirstOrDefault(x => x.Key == "Arguments");
+        var arguments = argumentsProperty is { Key: not null, Value: { IsNull: false, Kind: TypedConstantKind.Array } }
+            ? argumentsProperty.Value.Values
+            : ImmutableArray<TypedConstant>.Empty;
+
+        ImmutableArray<ISymbol> firstDeclaredMembers = default;
+        IMethodSymbol? bestMethod = null;
+        IMethodSymbol? firstMethod = null;
+        var bestScore = -1;
+        List<IMethodSymbol>? candidates = null;
+
+        // Walk base types: with [InheritsTests] (or a data member declared on a base class) the member
+        // may not be declared directly on the test class. Missing it would emit a plain
+        // MethodDataSourceAttribute without a Factory (https://github.com/thomhurst/TUnit/issues/6162).
+        for (var searchType = targetType; searchType is not null; searchType = searchType.BaseType)
+        {
+            var members = searchType.GetMembers(memberName);
+            if (members.Length == 0)
+            {
+                continue;
+            }
+
+            var isFirstDeclaringType = firstDeclaredMembers.IsDefault;
+            if (isFirstDeclaringType)
+            {
+                firstDeclaredMembers = members;
+            }
+
+            var isBaseType = !SymbolEqualityComparer.Default.Equals(searchType, targetType);
+            foreach (var member in members)
+            {
+                if (member is not IMethodSymbol method)
+                {
+                    continue;
+                }
+
+                // Reflection never returns a private base member, nor a base method that a derived one overrides
+                // or hides by signature. A base method the generated class cannot call (protected, or internal to
+                // another assembly) is skipped as well, so choosing it cannot break the build.
+                if (isBaseType
+                    && (method.DeclaredAccessibility == Accessibility.Private
+                        || !compilation.IsSymbolAccessibleWithin(method, compilation.Assembly)
+                        || IsHiddenBySignature(method, candidates)))
+                {
+                    continue;
+                }
+
+                (candidates ??= []).Add(method);
+
+                // A generic data method is never a fallback while a non-generic one exists: its type arguments
+                // cannot be inferred from the Arguments, and inference would close the test over its open T
+                if (isFirstDeclaringType && (firstMethod == null || (firstMethod.IsGenericMethod && !method.IsGenericMethod)))
+                {
+                    firstMethod = method;
+                }
+
+                // Strictly better only, so on an exact tie the earlier, more derived declaration is kept, as the
+                // reflection binder prefers the most derived of otherwise equal methods
+                var score = ScoreDataSourceOverload(method, arguments, compilation);
+                if (score > bestScore
+                    || (score == bestScore && score >= 0 && IsMoreSpecificDataSourceOverload(method, bestMethod!, arguments.Length, compilation)))
+                {
+                    // On a tie, the overload with the more specific parameter types wins, as with the reflection
+                    // binder: Rows(long) beats Rows(object) for an int argument.
+                    bestScore = score;
+                    bestMethod = method;
+                }
+            }
+        }
+
+        if (bestMethod != null)
+        {
+            return bestMethod;
+        }
+
+        if (firstDeclaredMembers.IsDefault)
+        {
+            return null;
+        }
+
+        // No overload accepts the arguments: prefer a property or field, else keep the first
+        // method so the generated call reports the mismatch as before. Generic type inference may then
+        // read the row type of a method whose call fails. That is harmless: TUnit0001 reports Arguments
+        // that no overload accepts as a compile error, so this is reached only with it suppressed, and the
+        // data source then fails when it runs, as it does in reflection mode. Returning null instead would
+        // leave a generic test with no inferred type arguments, so it would disappear without an error.
+        foreach (var member in firstDeclaredMembers)
+        {
+            if (member is IPropertySymbol or IFieldSymbol)
+            {
+                return member;
+            }
+        }
+
+        return firstMethod ?? firstDeclaredMembers[0];
+    }
+
+    /// <summary>
+    /// Whether a more derived candidate already declares <paramref name="method"/>'s signature (same type
+    /// parameter count, parameter types and ref kinds), so it overrides or hides this base method and
+    /// reflection's <c>GetMethods</c> would not return it.
+    /// </summary>
+    private static bool IsHiddenBySignature(IMethodSymbol method, List<IMethodSymbol>? derivedCandidates)
+    {
+        if (derivedCandidates is null)
+        {
+            return false;
+        }
+
+        foreach (var derived in derivedCandidates)
+        {
+            if (derived.Arity != method.Arity || derived.Parameters.Length != method.Parameters.Length)
+            {
+                continue;
+            }
+
+            var sameSignature = true;
+            for (var i = 0; i < method.Parameters.Length; i++)
+            {
+                if (derived.Parameters[i].RefKind != method.Parameters[i].RefKind
+                    || !SymbolEqualityComparer.Default.Equals(derived.Parameters[i].Type, method.Parameters[i].Type))
+                {
+                    sameSignature = false;
+                    break;
+                }
+            }
+
+            if (sameSignature)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether every parameter of <paramref name="candidate"/> that receives an argument converts implicitly to the
+    /// matching parameter of <paramref name="other"/>, and they differ. Mirrors <c>IsMoreSpecific</c> in
+    /// <c>MethodDataSourceAttribute</c>.
+    /// </summary>
+    private static bool IsMoreSpecificDataSourceOverload(IMethodSymbol candidate, IMethodSymbol other, int argumentCount, Compilation compilation)
+    {
+        // Only called for two overloads that both scored >= 0, and ScoreDataSourceOverload returns -1 when
+        // there are more arguments than parameters, so both have at least argumentCount parameters. Check it anyway:
+        // an exception here would surface as an opaque generator failure, and "not more specific" is a safe answer.
+        if (argumentCount > candidate.Parameters.Length || argumentCount > other.Parameters.Length)
+        {
+            return false;
+        }
+
+        var anyDifferent = false;
+        for (var i = 0; i < argumentCount; i++)
+        {
+            var candidateType = candidate.Parameters[i].Type;
+            var otherType = other.Parameters[i].Type;
+            if (SymbolEqualityComparer.Default.Equals(candidateType, otherType))
+            {
+                continue;
+            }
+
+            if (compilation.ClassifyCommonConversion(candidateType, otherType) is not { IsImplicit: true, IsUserDefined: false })
+            {
+                return false;
+            }
+
+            anyDifferent = true;
+        }
+
+        return anyDifferent;
+    }
+
+    /// <summary>
+    /// Scores how well <paramref name="method"/> accepts the [MethodDataSource] <c>Arguments</c>:
+    /// -1 when it cannot be called with them, otherwise higher for exact argument types.
+    /// An overload with exactly one parameter per argument always outranks one that needs missing
+    /// parameters filled in, because reflection mode's binder only considers exact-count overloads.
+    /// It falls back to the method's name alone, which works when there is a single overload.
+    /// Missing trailing parameters must be optional or a CancellationToken, which is what reflection
+    /// mode's <c>BuildInvokeArgs</c> fills in and <see cref="BuildDataSourceCallArguments"/> emits.
+    /// </summary>
+    private static int ScoreDataSourceOverload(IMethodSymbol method, ImmutableArray<TypedConstant> arguments, Compilation compilation)
+    {
+        var parameters = method.Parameters;
+
+        // A generic data method needs type arguments the Arguments cannot supply. Reflection mode's binder skips it
+        // too, so IEnumerable<int> Rows() wins over IEnumerable<T> Rows<T>() whichever is declared first.
+        if (method.IsGenericMethod || arguments.Length > parameters.Length)
+        {
+            return -1;
+        }
+
+        // Each argument adds at most 2, so this base puts every exact-count overload above every other one
+        var score = arguments.Length == parameters.Length ? 2 * arguments.Length + 1 : 0;
+        for (var i = 0; i < parameters.Length; i++)
+        {
+            var parameterType = parameters[i].Type;
+            if (i >= arguments.Length)
+            {
+                if (!parameters[i].HasExplicitDefaultValue && !parameterType.IsCancellationToken())
+                {
+                    return -1;
+                }
+
+                continue;
+            }
+
+            var argument = arguments[i];
+            if (argument.IsNull || argument.Type == null)
+            {
+                if (parameterType.IsValueType && parameterType.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T)
+                {
+                    return -1;
+                }
+
+                continue;
+            }
+
+            if (SymbolEqualityComparer.Default.Equals(argument.Type, parameterType))
+            {
+                score += 2;
+            }
+            else if (IsInvokeConversion(compilation.ClassifyCommonConversion(argument.Type, parameterType), argument.Type, parameterType))
+            {
+                score += 1;
+            }
+            else
+            {
+                return -1;
+            }
+        }
+
+        return score;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="conversion"/> from a boxed <paramref name="argumentType"/> argument to
+    /// <paramref name="parameterType"/> is one that reflection mode's binder and <c>MethodInfo.Invoke</c> also make:
+    /// implicit reference and boxing conversions, built-in numeric widening other than to <c>decimal</c>, and
+    /// <c>T</c> to <c>Nullable&lt;T&gt;</c>. C# also converts <c>int</c> to <c>decimal</c> or <c>long?</c>, but
+    /// reflection cannot, so accepting them would make the two modes call different overloads: for <c>1</c>,
+    /// <c>Rows(object)</c> in reflection mode and <c>Rows(decimal)</c> here. User-defined operators never apply.
+    /// Mirrors <c>ScoreArguments</c> in <c>MethodDataSourceAttribute</c>.
+    /// </summary>
+    private static bool IsInvokeConversion(Microsoft.CodeAnalysis.Operations.CommonConversion conversion, ITypeSymbol? argumentType, ITypeSymbol parameterType)
+    {
+        if (conversion is not { IsImplicit: true, IsUserDefined: false })
+        {
+            return false;
+        }
+
+        if (conversion.IsNullable)
+        {
+            return parameterType is INamedTypeSymbol { TypeArguments: [var underlying] }
+                && SymbolEqualityComparer.Default.Equals(underlying, argumentType);
+        }
+
+        return !conversion.IsNumeric || parameterType.SpecialType != SpecialType.System_Decimal;
+    }
+
+    /// <summary>
+    /// Returns the declared type of one data row produced by a [MethodDataSource] member, unwrapping the
+    /// shapes the generated factory enumerates: <c>Task&lt;T&gt;</c>/<c>ValueTask&lt;T&gt;</c>, then
+    /// <c>IEnumerable&lt;T&gt;</c> or arrays (or <c>IAsyncEnumerable&lt;T&gt;</c> when not task-wrapped),
+    /// then one <c>Func&lt;T&gt;</c>, one <c>TestDataRow&lt;T&gt;</c> and one <c>Func&lt;T&gt;</c> inside it,
+    /// matching what the runtime row reader invokes and unwraps.
+    /// Returns <see langword="null"/> when the row type cannot say anything about the test's type
+    /// arguments (<c>object</c> or <c>object[]</c> rows, or a non-generic <c>IEnumerable</c>), since
+    /// those are only known at runtime.
+    /// </summary>
+    private static ITypeSymbol? GetMethodDataSourceRowType(ISymbol dataSourceMember, MethodDataSourceRowTypes wellKnown, Compilation compilation)
+    {
+        var type = dataSourceMember switch
+        {
+            IMethodSymbol method => method.ReturnType,
+            IPropertySymbol property => property.Type,
+            IFieldSymbol field => field.Type,
+            _ => null
+        };
+
+        if (type == null)
+        {
+            return null;
+        }
+
+        // Looked up once per compilation, not per attribute
+        var taskType = wellKnown.TaskType;
+        var valueTaskType = wellKnown.ValueTaskType;
+        var funcType = wellKnown.FuncType;
+        var asyncEnumerableType = wellKnown.AsyncEnumerableType;
+        var testDataRowType = wellKnown.TestDataRowType;
+
+        var isTaskWrapped = false;
+        if (type is INamedTypeSymbol { IsGenericType: true } namedTask
+            && (IsDefinition(namedTask, taskType) || IsDefinition(namedTask, valueTaskType)))
+        {
+            type = namedTask.TypeArguments[0];
+            isTaskWrapped = true;
+        }
+
+        if (type is IArrayTypeSymbol arrayType)
+        {
+            type = arrayType.ElementType;
+        }
+        else if (type.SpecialType != SpecialType.System_String && !type.IsTupleType)
+        {
+            // The Task/ValueTask factories only enumerate a synchronous IEnumerable; an awaited
+            // IAsyncEnumerable is passed through as one row, as in reflection mode.
+            if (!isTaskWrapped && GetGenericInterfaceArgument(type, asyncEnumerableType) is { } asyncElementType)
+            {
+                type = asyncElementType;
+            }
+            else if (type.IsIEnumerable(compilation, out var elementType))
+            {
+                type = elementType;
+            }
+            else if (IsNonGenericEnumerable(type))
+            {
+                // A non-generic IEnumerable is enumerated by the factory, but its items' types are unknown
+                return null;
+            }
+        }
+
+        // Peel only the layers the row reader removes: DataSourceHelpers.ToObjectArray invokes one
+        // outer Func, then TestDataRowUnwrapper.UnwrapArray strips one TestDataRow and invokes one
+        // Func inside it. Anything nested deeper reaches the test as a value (e.g. a Func<int> row
+        // from Func<Func<int>>), so inference must see that value's type too.
+        type = Unwrap(type, funcType);
+        if (TryUnwrap(type, testDataRowType, out var rowData))
+        {
+            type = Unwrap(rowData, funcType);
+        }
+
+        if (type.SpecialType == SpecialType.System_Object
+            || type is IArrayTypeSymbol { ElementType.SpecialType: SpecialType.System_Object })
+        {
+            return null;
+        }
+
+        return type;
+
+        static bool IsDefinition(INamedTypeSymbol type, INamedTypeSymbol? definition)
+            => definition != null && SymbolEqualityComparer.Default.Equals(type.OriginalDefinition, definition);
+
+        static ITypeSymbol Unwrap(ITypeSymbol type, INamedTypeSymbol? definition)
+            => TryUnwrap(type, definition, out var inner) ? inner : type;
+
+        static bool TryUnwrap(ITypeSymbol type, INamedTypeSymbol? definition, out ITypeSymbol inner)
+        {
+            if (type is INamedTypeSymbol { IsGenericType: true } wrapper && IsDefinition(wrapper, definition))
+            {
+                inner = wrapper.TypeArguments[0];
+                return true;
+            }
+
+            inner = type;
+            return false;
+        }
+
+        static bool IsNonGenericEnumerable(ITypeSymbol type)
+        {
+            if (type.SpecialType == SpecialType.System_Collections_IEnumerable)
+            {
+                return true;
+            }
+
+            foreach (var @interface in type.AllInterfaces)
+            {
+                if (@interface.SpecialType == SpecialType.System_Collections_IEnumerable)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private static ITypeSymbol? GetGenericInterfaceArgument(ITypeSymbol type, INamedTypeSymbol? interfaceDefinition)
+    {
+        if (interfaceDefinition == null)
+        {
+            return null;
+        }
+
+        if (type is INamedTypeSymbol { IsGenericType: true } namedType
+            && SymbolEqualityComparer.Default.Equals(namedType.OriginalDefinition, interfaceDefinition))
+        {
+            return namedType.TypeArguments[0];
+        }
+
+        foreach (var @interface in type.AllInterfaces)
+        {
+            if (SymbolEqualityComparer.Default.Equals(@interface.OriginalDefinition, interfaceDefinition))
+            {
+                return @interface.TypeArguments[0];
+            }
+        }
+
+        return null;
     }
 
     private static ITypeSymbol[]? InferClassTypesFromMethodDataSource(TestMethodMetadata testMethod, AttributeData mdsAttr)
@@ -6002,12 +8259,13 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         // Get class type parameters
         var classTypeParams = testMethod.TypeSymbol.TypeParameters;
         var genericParamMap = new Dictionary<string, ITypeSymbol>();
+        // CancellationToken parameters are supplied by the engine, not by the row.
+        var testMethodParams = GetDataParameters(testMethod.MethodSymbol);
 
         // If it's a tuple, map tuple elements to method parameters
         if (dataType.IsTupleType)
         {
             var tupleElements = dataType.TupleElements;
-            var testMethodParams = testMethod.MethodSymbol.Parameters;
 
             for (var i = 0; i < testMethodParams.Length && i < tupleElements.Length; i++)
             {
@@ -6019,9 +8277,9 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             }
         }
         // If it's a single type that matches a class type parameter
-        else if (testMethod.MethodSymbol.Parameters.Length == 1)
+        else if (testMethodParams.Length == 1)
         {
-            var paramType = testMethod.MethodSymbol.Parameters[0].Type;
+            var paramType = testMethodParams[0].Type;
             ProcessTypeForGenerics(paramType, dataType, classTypeParams, genericParamMap);
         }
 
@@ -6048,6 +8306,15 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             return;
         }
 
+        // Arrays such as T[] fed an int[]
+        if (paramType is IArrayTypeSymbol paramArray
+            && actualType is IArrayTypeSymbol actualArray
+            && paramArray.Rank == actualArray.Rank)
+        {
+            ProcessTypeForGenerics(paramArray.ElementType, actualArray.ElementType, genericParams, genericParamMap);
+            return;
+        }
+
         // Check for generic types like IEnumerable<T>, Func<T1, T2>, etc.
         if (paramType is INamedTypeSymbol { IsGenericType: true } namedParamType &&
             actualType is INamedTypeSymbol { IsGenericType: true } namedActualType &&
@@ -6061,82 +8328,179 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         }
     }
 
-    private static bool ValidateTypeConstraints(IMethodSymbol method, ITypeSymbol[] typeArguments)
+    /// <summary>
+    /// Validates the method's own type arguments. Class type parameters are validated separately by
+    /// <see cref="ValidateClassTypeConstraints"/>, but a method constraint may name them
+    /// (<c>where U : IEnumerable&lt;T&gt;</c>), so the class's type arguments, when known, are
+    /// substituted into the method's constraints before they are checked.
+    /// </summary>
+    private static bool ValidateTypeConstraints(IMethodSymbol method, ITypeSymbol[] typeArguments, Compilation compilation,
+        INamedTypeSymbol? classSymbol = null, ITypeSymbol[]? classTypeArguments = null)
     {
-        // Only validate method type parameters here - class type parameters are validated separately
-        // by ValidateClassTypeConstraints in the cartesian product loop
         var methodTypeParams = method.TypeParameters;
 
-        if (methodTypeParams.Length != typeArguments.Length)
-        {
-            return false;
-        }
-
-        return ValidateTypeParameterConstraints(methodTypeParams, typeArguments);
+        return methodTypeParams.Length == typeArguments.Length
+            && !TryFindConstraintViolation(methodTypeParams, typeArguments, compilation, out _, classSymbol, classTypeArguments);
     }
 
-    private static bool ValidateTypeParameterConstraints(ImmutableArray<ITypeParameterSymbol> typeParams, ITypeSymbol[] typeArguments)
+    /// <summary>
+    /// Describes the first method generic constraint that <paramref name="typeArguments"/> breaks.
+    /// The wording matches <c>TestGenericTypeResolver.ValidateAgainstConstraints</c> in TUnit.Engine,
+    /// so source-generated and reflection modes report the same failure message.
+    /// </summary>
+    private static string DescribeMethodConstraintViolation(IMethodSymbol method, ITypeSymbol[] typeArguments, Compilation compilation,
+        INamedTypeSymbol? classSymbol = null, ITypeSymbol[]? classTypeArguments = null)
+        => DescribeConstraintViolation(method.TypeParameters, typeArguments, $"method '{method.Name}'", compilation, classSymbol, classTypeArguments);
+
+    /// <summary>
+    /// A key that identifies one attribute application, so that each invalid row or type is
+    /// reported once even when it is visited by several inference passes.
+    /// </summary>
+    private static string GetAttributeKey(AttributeData attribute)
     {
-        for (var i = 0; i < typeParams.Length; i++)
+        return attribute.ApplicationSyntaxReference is { } reference
+            ? $"{reference.SyntaxTree.FilePath}:{reference.Span.Start.ToString(CultureInfo.InvariantCulture)}"
+            : RuntimeHelpers.GetHashCode(attribute).ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Describes the first generic constraint of <paramref name="typeParams"/> that
+    /// <paramref name="typeArguments"/> break. The wording matches <c>TestGenericTypeResolver</c> and
+    /// <c>ReflectionGenericTypeResolver.FindConstraintViolation</c> in TUnit.Engine, so
+    /// source-generated and reflection modes report the same failure message.
+    /// </summary>
+    private static string DescribeConstraintViolation(ImmutableArray<ITypeParameterSymbol> typeParams, ITypeSymbol[] typeArguments, string owner, Compilation compilation,
+        INamedTypeSymbol? outerType = null, ITypeSymbol[]? outerTypeArguments = null)
+    {
+        if (TryFindConstraintViolation(typeParams, typeArguments, compilation, out var message, outerType, outerTypeArguments) && message != null)
+        {
+            return message;
+        }
+
+        // A constraint without a specific message (such as new()): reflection mode reports the
+        // MakeGenericType/MakeGenericMethod failure with this wording.
+        var typeArgumentNames = string.Join(", ", typeArguments.Select(GetRuntimeTypeName));
+        return $"Type arguments '{typeArgumentNames}' do not satisfy the generic constraints of {owner}";
+    }
+
+    /// <summary>
+    /// The name that <c>System.Type.Name</c> gives <paramref name="type"/>, so constraint messages read the
+    /// same in both modes. Roslyn gives arrays an empty <c>MetadataName</c>; reflection names them <c>Int32[]</c>.
+    /// </summary>
+    private static string GetRuntimeTypeName(ITypeSymbol type) => type switch
+    {
+        IArrayTypeSymbol array => GetRuntimeTypeName(array.ElementType)
+            + (array.Rank == 1 ? "[]" : "[" + new string(',', array.Rank - 1) + "]"),
+        _ => type.MetadataName,
+    };
+
+    /// <summary>
+    /// Explains a constraint failure for a type argument that was inferred from a data source's declared
+    /// type, which a value of a more derived run-time type could satisfy (#7116). Source-generated mode
+    /// emits a call for each type argument at compile time, so it cannot follow the values' run-time
+    /// types the way reflection mode does with <c>MakeGenericMethod</c>; that would not be Native AOT
+    /// compatible. TUnit0001 reports the same case at compile time.
+    /// </summary>
+    // Keep this wording in step with the analyzer's TUnit0001DeclaredType* strings in
+    // src/TUnit.Analyzers/Resources.resx, which explain the same case at compile time.
+    private static string DescribeDeclaredTypeInference(ITypeParameterSymbol typeParameter, ITypeSymbol typeArgument)
+        => $". '{typeParameter.Name}' was inferred from the declared type '{typeArgument.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)}' of the data source, not from the run-time type of its values: "
+            + "source-generated mode creates generic tests at compile time so that they stay Native AOT compatible. "
+            + "Declare the data source with a type that satisfies the constraint, or list the type argument with [GenerateGenericTest].";
+
+    private static bool HasConstraintViolation(ImmutableArray<ITypeParameterSymbol> typeParams, ITypeSymbol[] typeArguments, Compilation compilation)
+        => TryFindConstraintViolation(typeParams, typeArguments, compilation, out _);
+
+    /// <summary>
+    /// Finds the first generic constraint of <paramref name="typeParams"/> that
+    /// <paramref name="typeArguments"/> break, checked in the engine's order: struct, class, base
+    /// type, interfaces, then new(). <paramref name="message"/> is <c>null</c> for a constraint that
+    /// the engine reports without a specific message.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="outerType"/> and <paramref name="outerTypeArguments"/> give the containing class's
+    /// type arguments when <paramref name="typeParams"/> are a method's, so a method constraint naming a
+    /// class type parameter is checked against that parameter's type argument.
+    /// </remarks>
+    private static bool TryFindConstraintViolation(ImmutableArray<ITypeParameterSymbol> typeParams, ITypeSymbol[] typeArguments, Compilation compilation, out string? message,
+        INamedTypeSymbol? outerType = null, ITypeSymbol[]? outerTypeArguments = null)
+        => TryFindConstraintViolation(typeParams, typeArguments, compilation, out message, out _, outerType, outerTypeArguments);
+
+    /// <inheritdoc cref="TryFindConstraintViolation(ImmutableArray{ITypeParameterSymbol}, ITypeSymbol[], Compilation, out string?, INamedTypeSymbol?, ITypeSymbol[])"/>
+    /// <param name="violatingIndex">The index of the type argument that breaks a constraint.</param>
+    private static bool TryFindConstraintViolation(ImmutableArray<ITypeParameterSymbol> typeParams, ITypeSymbol[] typeArguments, Compilation compilation, out string? message,
+        out int violatingIndex, INamedTypeSymbol? outerType = null, ITypeSymbol[]? outerTypeArguments = null)
+    {
+        violatingIndex = -1;
+        var substitutionParams = typeParams;
+        var substitutionArguments = typeArguments;
+        if (outerType is { TypeParameters.Length: > 0 } && outerTypeArguments is { } outerArguments
+            && outerArguments.Length == outerType.TypeParameters.Length)
+        {
+            substitutionParams = outerType.TypeParameters.AddRange(typeParams);
+            substitutionArguments = outerArguments.Concat(typeArguments).ToArray();
+        }
+
+        for (var i = 0; i < typeParams.Length && i < typeArguments.Length; i++)
         {
             var typeParam = typeParams[i];
             var typeArg = typeArguments[i];
 
-            // Check struct constraint
-            if (typeParam.HasValueTypeConstraint)
+            // Nullable<T> is a value type but never satisfies 'struct'.
+            if (typeParam.HasValueTypeConstraint
+                && (!typeArg.IsValueType || typeArg.IsReferenceType || typeArg.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T))
             {
-                if (!typeArg.IsValueType || typeArg.IsReferenceType)
-                {
-                    return false;
-                }
+                message = $"Type '{GetRuntimeTypeName(typeArg)}' does not satisfy the 'struct' constraint for generic parameter '{typeParam.Name}'";
+                violatingIndex = i;
+                return true;
             }
 
-            // Check class constraint
-            if (typeParam.HasReferenceTypeConstraint)
+            if (typeParam.HasReferenceTypeConstraint && !typeArg.IsReferenceType)
             {
-                if (!typeArg.IsReferenceType)
-                {
-                    return false;
-                }
+                message = $"Type '{GetRuntimeTypeName(typeArg)}' does not satisfy the 'class' constraint for generic parameter '{typeParam.Name}'";
+                violatingIndex = i;
+                return true;
             }
 
-            // Check interface constraints
+            // The engine checks the base type constraint before interface constraints. A constraint
+            // naming another type parameter (`where T : U`) is checked against U's type argument.
             foreach (var constraintType in typeParam.ConstraintTypes)
             {
-                // Substitute type parameters in the constraint type with the actual type arguments
-                var substitutedConstraint = SubstituteTypeParameters(constraintType, typeParams, typeArguments);
-
-                if (substitutedConstraint.TypeKind == TypeKind.Interface)
+                var substitutedConstraint = SubstituteTypeParameters(constraintType, substitutionParams, substitutionArguments, compilation);
+                if (substitutedConstraint.TypeKind is not (TypeKind.Interface or TypeKind.TypeParameter or TypeKind.Error)
+                    && !SatisfiesTypeConstraint(typeArg, substitutedConstraint, compilation))
                 {
-                    // Check if the type argument implements the interface
-                    if (!TypeImplementsInterface(typeArg, substitutedConstraint))
-                    {
-                        return false;
-                    }
+                    message = $"Type '{GetRuntimeTypeName(typeArg)}' does not satisfy the base type constraint '{GetRuntimeTypeName(substitutedConstraint)}' for generic parameter '{typeParam.Name}'";
+                    violatingIndex = i;
+                    return true;
                 }
-                else if (substitutedConstraint.TypeKind == TypeKind.Class)
+            }
+
+            foreach (var constraintType in typeParam.ConstraintTypes)
+            {
+                var substitutedConstraint = SubstituteTypeParameters(constraintType, substitutionParams, substitutionArguments, compilation);
+                if (substitutedConstraint.TypeKind == TypeKind.Interface
+                    && !SatisfiesTypeConstraint(typeArg, substitutedConstraint, compilation))
                 {
-                    // Check if the type argument derives from the base class
-                    var baseType = typeArg.BaseType;
-                    var found = false;
-                    while (baseType != null)
-                    {
-                        if (SymbolEqualityComparer.Default.Equals(baseType, substitutedConstraint))
-                        {
-                            found = true;
-                            break;
-                        }
-                        baseType = baseType.BaseType;
-                    }
-                    if (!found)
-                    {
-                        return false;
-                    }
+                    message = $"Type '{GetRuntimeTypeName(typeArg)}' does not implement interface '{GetRuntimeTypeName(substitutedConstraint)}' required for generic parameter '{typeParam.Name}'";
+                    violatingIndex = i;
+                    return true;
                 }
             }
         }
 
-        return true;
+        for (var i = 0; i < typeParams.Length && i < typeArguments.Length; i++)
+        {
+            if (typeParams[i].HasConstructorConstraint && !SatisfiesConstructorConstraint(typeArguments[i]))
+            {
+                message = null;
+                violatingIndex = i;
+                return true;
+            }
+        }
+
+        message = null;
+        return false;
     }
 
     private static void GenerateConcreteTestMetadata(
@@ -6347,6 +8711,16 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
             }
         }
 
+        // Handle arrays like T[] (e.g. a `params T[]` parameter)
+        if (type is IArrayTypeSymbol arrayType)
+        {
+            var elementType = SubstituteTypeParameters(arrayType.ElementType, testMethod, classTypeArgs, methodTypeArgs);
+
+            return SymbolEqualityComparer.Default.Equals(elementType, arrayType.ElementType)
+                ? type
+                : testMethod.CompilationContext.Compilation.CreateArrayTypeSymbol(elementType, arrayType.Rank);
+        }
+
         // Handle generic types like IEnumerable<T>, Dictionary<TKey, TValue>, etc.
         if (type is INamedTypeSymbol { IsGenericType: true } namedType)
         {
@@ -6520,8 +8894,10 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
 
     private static bool AreSameAttribute(AttributeData a1, AttributeData a2)
     {
-        // Compare attributes by their constructor arguments and attribute class
-        if (a1.AttributeClass?.Name != a2.AttributeClass?.Name)
+        // Compare attributes by their constructor arguments and attribute class. The class is compared
+        // as a constructed type, not by name: ClassDataSource<A> and ClassDataSource<B> share a name and
+        // take no constructor arguments, yet each scopes a different instantiation (#7158).
+        if (!SymbolEqualityComparer.Default.Equals(a1.AttributeClass, a2.AttributeClass))
         {
             return false;
         }
@@ -6534,6 +8910,71 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
         for (var i = 0; i < a1.ConstructorArguments.Length; i++)
         {
             if (!a1.ConstructorArguments[i].Equals(a2.ConstructorArguments[i]))
+            {
+                return false;
+            }
+        }
+
+        // Named arguments tell attributes apart too: [MethodDataSource(nameof(Rows), Arguments = ...)] twice can
+        // name different overloads of Rows, each scoping its own instantiation (#7208). They are matched by name,
+        // since their written order carries no meaning, and array values by content.
+        if (a1.NamedArguments.Length != a2.NamedArguments.Length)
+        {
+            return false;
+        }
+
+        foreach (var named in a1.NamedArguments)
+        {
+            var found = false;
+            foreach (var other in a2.NamedArguments)
+            {
+                if (other.Key == named.Key)
+                {
+                    found = AreSameTypedConstant(named.Value, other.Value);
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Compares typed constants by value, and array constants element by element: Roslyn's
+    /// <see cref="TypedConstant.Equals(TypedConstant)"/> compares an array's backing storage, so two separately
+    /// written arrays with the same elements differ under it. The type is compared too, so empty arrays of
+    /// different element types stay distinct.
+    /// </summary>
+    private static bool AreSameTypedConstant(TypedConstant first, TypedConstant second)
+    {
+        if (first.Kind != second.Kind || !SymbolEqualityComparer.Default.Equals(first.Type, second.Type))
+        {
+            return false;
+        }
+
+        if (first.Kind != TypedConstantKind.Array)
+        {
+            return first.Equals(second);
+        }
+
+        if (first.IsNull || second.IsNull)
+        {
+            return first.IsNull == second.IsNull;
+        }
+
+        if (first.Values.Length != second.Values.Length)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < first.Values.Length; i++)
+        {
+            if (!AreSameTypedConstant(first.Values[i], second.Values[i]))
             {
                 return false;
             }
@@ -6663,6 +9104,60 @@ public sealed class TestMetadataGenerator : IIncrementalGenerator
                 return null;
             }
             result[i] = inferredType;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// The class type arguments that a class-level typed data source (<c>DataSourceGeneratorAttribute&lt;T...&gt;</c>)
+    /// infers through the constructor: its type arguments, or the elements of a single tuple type argument, are
+    /// the constructor parameters' types. Returns null for any other source, or when the types do not line up.
+    /// </summary>
+    private static ITypeSymbol[]? InferClassTypesFromTypedClassDataSource(INamedTypeSymbol classSymbol, INamedTypeSymbol attributeClass)
+    {
+        if (GetTypedDataSourceBase(attributeClass) is not { } typedBase)
+        {
+            return null;
+        }
+
+        var constructor = classSymbol.Constructors
+            .Where(c => !c.IsStatic && c.DeclaredAccessibility == Accessibility.Public)
+            .OrderByDescending(c => c.Parameters.Length)
+            .FirstOrDefault();
+        if (constructor is not { Parameters.Length: > 0 })
+        {
+            return null;
+        }
+
+        var valueTypes = typedBase.TypeArguments;
+        if (valueTypes.Length != constructor.Parameters.Length
+            && valueTypes is [INamedTypeSymbol { IsTupleType: true } tupleType]
+            && tupleType.TupleElements.Length == constructor.Parameters.Length)
+        {
+            valueTypes = tupleType.TupleElements.Select(e => e.Type).ToImmutableArray();
+        }
+
+        if (valueTypes.Length != constructor.Parameters.Length)
+        {
+            return null;
+        }
+
+        var inferredTypes = new Dictionary<string, ITypeSymbol>();
+        for (var i = 0; i < valueTypes.Length; i++)
+        {
+            MapGenericTypeArguments(constructor.Parameters[i].Type, valueTypes[i], inferredTypes);
+        }
+
+        var result = new ITypeSymbol[classSymbol.TypeParameters.Length];
+        for (var i = 0; i < result.Length; i++)
+        {
+            if (!inferredTypes.TryGetValue(classSymbol.TypeParameters[i].Name, out var type))
+            {
+                return null;
+            }
+
+            result[i] = type;
         }
 
         return result;

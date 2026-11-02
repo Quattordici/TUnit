@@ -5,7 +5,7 @@
 # SQUASH-SAFE DETECTION — this is the whole point:
 #   A squash (or rebase) merge rewrites history, so the branch tip is NOT an ancestor
 #   of main and `git merge-base --is-ancestor` reports "not merged". Ancestry is never
-#   used as a merge signal for branches. GitHub's own records are, in four tiers:
+#   used as a merge signal for branches. GitHub's own records are, in five tiers:
 #     1. merged-PR head branch name  (cheap, bulk: one `gh pr list` call)
 #     2. merged-PR head tip SHA      (same call: catches detached checkouts sitting
 #                                     exactly on a merged PR's tip)
@@ -19,6 +19,19 @@
 #                                     window aging out). Named worktrees must match the
 #                                     associated PR's head branch; a shared commit alone
 #                                     does not prove that a new branch was merged.
+#     5. closed work item            (`gh api repos/../issues/<N>`, one call per worktree
+#                                     still unmatched whose identity is `pr-<N>` or
+#                                     `issue-<N>`: Get-WorktreeLockName, else a
+#                                     `pr-<N>[-*]`/`issue-<N>[-*]` directory name).
+#                                     Catches review branches named differently from the
+#                                     PR head, local commits after a merge, and PRs closed
+#                                     unmerged. Nothing comes back for such a checkout, so
+#                                     its work is retained instead of the directory: the
+#                                     branch is kept, uncommitted changes are saved to
+#                                     `retained-worktrees/<item>-wip-<sha>` (restore with
+#                                     `git stash apply`), and a detached HEAD to
+#                                     `retained-worktrees/<SHA>`. Removal holds a temporary
+#                                     AgentLocks lease on the item, so a live owner keeps it.
 #
 #   DELIBERATELY NOT a signal: a [gone] upstream branch. [gone] only means the remote
 #   ref was deleted — which also happens when a PR is CLOSED UNMERGED and its branch
@@ -33,20 +46,34 @@
 #   (its .git file targets $mainRepo/.git/worktrees/* and that gitdir is gone).
 #   Dirs without a .git worktree marker (artifacts, scratch output) are never touched.
 #
+# AGENT EVIDENCE:
+#   Entries under <main checkout>-evidence/ (one per work item) named pr-<N>/issue-<N>
+#   are removed once that item is closed (merged or not) and no registered worktree
+#   still resolves to it, under a temporary AgentLocks lease on the item. Any
+#   entry is removed once its newest write is older than -EvidenceRetentionDays (default 7).
+#
 # Guards (never delete work):
 #   - skip the main checkout and anything inside it (.claude/worktrees is harness-managed)
 #   - skip locked worktrees (an agent session may still own them)
 #   - skip a branch/tip that has an OPEN PR (branch reused for active work)
 #   - PRESERVE tracked changes and untracked files outside known generated directories
-#     or recognized root-level logs/PR notes covered by .gitignore
-#   - preserve local commits not contained in the merged PR's recorded head
+#     or recognized root-level logs/PR notes covered by .gitignore, except that the changes
+#     of a merged PR (tiers 1, 2, 4) or closed work item (tier 5) move to a retained
+#     branch; unknown ignored files are always preserved
+#   - preserve local commits not contained in the merged PR's recorded head (tier 5
+#     removes the checkout but keeps the branch)
+#   - save a checkout's work only under a temporary AgentLocks lease on its item: a closed
+#     item (tier 5), or a merged checkout with uncommitted work, is kept while its lock is
+#     held or unreadable; a dirty merged checkout without an item identity is kept too.
+#     Clean merged checkouts are removed without a lease.
 #   - worktrees with NO merge evidence are kept and listed; opt in to reaping old
 #     clean ones with -StaleDays <n>
 #
 # Run it once per loop iteration (cheap: ~3 gh calls in bulk, plus one association
-# call per unmatched leftover — a set that shrinks to near-zero after the first run).
+# and at most one item-state call per unmatched leftover — a set that shrinks to
+# near-zero after the first run).
 #
-# Usage:  pwsh scripts/Remove-MergedWorktrees.ps1 [-Repo owner/name] [-WhatIf] [-StaleDays n]
+# Usage:  pwsh scripts/Remove-MergedWorktrees.ps1 [-Repo owner/name] [-WhatIf] [-StaleDays n] [-EvidenceRetentionDays n]
 # Known ignored workflow output is disposable, like build artifacts.
 # -WhatIf reports the same dirty-file blockers as a real sweep.
 # Exit:   0 always (a sweep failure must not break the loop; problems are logged)
@@ -58,7 +85,10 @@ param(
     # Opt-in: also remove CLEAN worktrees with no PR evidence at all (scratch / A-B
     # checkouts, local-only fix branches) whose HEAD commit is older than this many
     # days. 0 = off. Dirty worktrees are still preserved.
-    [int]$StaleDays = 0
+    [int]$StaleDays = 0,
+    # Remove agent evidence entries whose newest file is older than this many days.
+    [ValidateRange(1, 3650)]
+    [int]$EvidenceRetentionDays = 7
 )
 
 $ErrorActionPreference = 'Stop'
@@ -142,6 +172,8 @@ try {
         # Tier 1: a merged branch name identifies the PR, but a reused branch or
         # local commits after the merge must not be discarded.
         $why = $null
+        $diverged = $false
+        $closedItem = $null
         if ($w.Branch -and $mergedNames.ContainsKey($w.Branch)) {
             foreach ($mergedHead in $mergedNames[$w.Branch]) {
                 if (Test-WorktreeHeadMerged -Repo $mainRepo -Head $sha -MergedHead $mergedHead) {
@@ -149,14 +181,13 @@ try {
                     break
                 }
             }
-            if (-not $why) {
-                Write-Host "sweep: preserving '$($w.Branch)' (local HEAD is not contained in a recorded merged PR head): $($w.Path)"
-                continue
-            }
+            # Local commits after the merge: only the closed-item tier below may remove
+            # this checkout, and it keeps the branch.
+            if (-not $why) { $diverged = $true }
         }
 
         # Tier 2: detached checkout sitting exactly on a merged PR's tip.
-        if (-not $why -and $w.Detached -and $mergedOids.ContainsKey($sha)) { $why = 'merged PR head tip SHA' }
+        if (-not $why -and -not $diverged -and $w.Detached -and $mergedOids.ContainsKey($sha)) { $why = 'merged PR head tip SHA' }
 
         # Tier 3 (detached only): checkout of a commit already reachable from main —
         # A/B baselines and gate parents. A named branch never qualifies here; it needs
@@ -168,7 +199,7 @@ try {
 
         # Tier 4: GitHub's commit→PR association. Survives squash merges, branch
         # deletion, and the 1000-PR list window. One API call, only for leftovers.
-        if (-not $why -and $sha -and $slug) {
+        if (-not $why -and -not $diverged -and $sha -and $slug) {
             $assocRaw = gh api "repos/$slug/commits/$sha/pulls" 2>$null
             if ($LASTEXITCODE -eq 0 -and $assocRaw) {
                 $assoc = @(($assocRaw -join "`n") | ConvertFrom-Json)
@@ -184,18 +215,62 @@ try {
             }
         }
 
+        # Tier 5: the checkout's work item is closed. Removal retains its work (see header).
+        if (-not $why -and $slug) {
+            $item = Get-WorktreeWorkItem -Worktree $w.Path
+            if ($item -cmatch '^(pr|issue)-(\d+)$') {
+                # The issues endpoint also serves pull requests; a merged PR is closed.
+                $state = gh api "repos/$slug/issues/$($Matches[2])" --jq .state 2>$null
+                if ($LASTEXITCODE -eq 0 -and ($state | Out-String).Trim() -ceq 'closed') {
+                    $why = "closed work item $item"
+                    $closedItem = $item
+                }
+            }
+        }
+
         # Opt-in stale tier: no PR evidence anywhere (never-pushed scratch). Only age
         # can justify removal, and only when the caller asked for it.
-        if (-not $why -and $StaleDays -gt 0 -and $sha) {
+        if (-not $why -and -not $diverged -and $StaleDays -gt 0 -and $sha) {
             $commitEpoch = git -C $w.Path log -1 --format=%ct 2>$null
             if ($LASTEXITCODE -eq 0 -and $commitEpoch -and (($nowEpoch - [long]$commitEpoch) -gt ($StaleDays * 86400L))) {
                 $why = "no PR evidence, HEAD commit older than $StaleDays day(s)"
             }
         }
 
-        if (-not $why) { $unmatched += $w; continue }
+        if (-not $why) {
+            if ($diverged) { Write-Host "sweep: preserving '$($w.Branch)' (local HEAD is not contained in a recorded merged PR head): $($w.Path)" }
+            else { $unmatched += $w }
+            continue
+        }
 
-        Remove-MergedWorktree -Repo $mainRepo -Worktree $w.Path -Label "($why)" -ExpectedHead $sha -WhatIf:$WhatIf
+        # Saving a checkout's work needs a temporary lease on its item: a live owner may still
+        # be working in it. A closed item (tier 5) always takes one. A merged PR (tiers 1, 2,
+        # 4) is a closed item too, but only a dirty checkout needs the lease, so a Redis outage
+        # never keeps a clean one; a dirty one without an item identity stays as before, and
+        # one dirtied after this check is preserved by Remove-MergedWorktree.
+        $leaseItem = $null
+        if ($closedItem) { $leaseItem = $closedItem }
+        elseif ($why -like 'merged PR*') {
+            $status = @(git -C $w.Path status --porcelain=v1 --untracked-files=all --ignored=matching 2>$null)
+            if ($LASTEXITCODE -eq 0 -and @(Get-WorktreeUncommittedWork -Status $status).Count -gt 0) {
+                $leaseItem = Get-WorktreeWorkItem -Worktree $w.Path
+            }
+        }
+        $agentLocks = Join-Path $mainRepo 'scripts/AgentLocks.ps1'
+        $owner = $null
+        if ($leaseItem) {
+            $owner = Enter-WorkItemCleanupLease -AgentLocks $agentLocks -LockName $leaseItem -WhatIf:$WhatIf
+            if (-not $owner) {
+                Write-Host "sweep: keeping worktree of $leaseItem (lock held or Redis unavailable): $($w.Path)"
+                continue
+            }
+        }
+        try {
+            Remove-MergedWorktree -Repo $mainRepo -Worktree $w.Path -Label "($why)" -ExpectedHead $sha -RetainWork:([bool]$leaseItem) -WorkItem $leaseItem -WhatIf:$WhatIf
+        }
+        finally {
+            if ($owner) { Exit-WorkItemCleanupLease -AgentLocks $agentLocks -LockName $leaseItem -Owner $owner -WhatIf:$WhatIf }
+        }
         if ($WhatIf) { continue }
         if (-not (Test-Path -LiteralPath $w.Path)) {
             $removed++
@@ -254,8 +329,39 @@ try {
         }
     }
 
+    # Evidence of a finished item goes with its last worktree. Work items still named by
+    # a registered worktree (or any worktree whose identity cannot be read) keep theirs.
+    $evidenceRoot = Get-AgentEvidenceRoot -MainCheckout $mainRepo
+    $finishedRemoved = 0
+    if ($slug) {
+        $activeLockNames = [System.Collections.Generic.List[string]]::new()
+        $identitiesReadable = $true
+        foreach ($w in $wts) {
+            # Worktrees removed above (or already gone from disk) no longer use evidence.
+            if ($w.Path -eq $mainRepo -or -not (Test-Path -LiteralPath $w.Path)) { continue }
+            try { $activeLockNames.Add((Get-WorktreeLockName -Worktree $w.Path)) }
+            catch { $identitiesReadable = $false }
+        }
+        if ($identitiesReadable) {
+            $isClosed = {
+                param([string]$LockName)
+                $number = $LockName.Substring($LockName.IndexOf('-') + 1)
+                # The issues endpoint also serves pull requests; a merged PR is closed.
+                $state = gh api "repos/$slug/issues/$number" --jq .state 2>$null
+                if ($LASTEXITCODE -ne 0) { throw "could not read state of $LockName" }
+                return ($state | Out-String).Trim() -ceq 'closed'
+            }
+            $finishedRemoved = Remove-FinishedAgentEvidence -Root $evidenceRoot -AgentLocks (Join-Path $mainRepo 'scripts/AgentLocks.ps1') -IsClosed $isClosed -ActiveLockNames $activeLockNames.ToArray() -WhatIf:$WhatIf
+        }
+        else {
+            Warn 'could not read every worktree identity -- keeping finished evidence this round'
+        }
+    }
+
+    $staleRemoved = Remove-StaleAgentEvidence -Root $evidenceRoot -RetentionDays $EvidenceRetentionDays -WhatIf:$WhatIf
+
     if (-not $WhatIf) { git -C $mainRepo worktree prune }
-    Write-Host "sweep: removed $removed merged worktree(s), $orphansRemoved orphaned dir(s)."
+    Write-Host "sweep: removed $removed merged or closed-item worktree(s), $orphansRemoved orphaned dir(s), $finishedRemoved finished and $staleRemoved stale evidence entr(ies)."
 }
 catch {
     Warn "unexpected sweep error (ignored, loop continues): $_"

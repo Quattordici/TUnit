@@ -31,9 +31,21 @@
 #              exit 0 (silent)           -> TTL re-armed. Call only for a unit that may
 #                                           run past the TTL, or once with -Worktree to
 #                                           write the auto-derive marker.
-#              stderr = "LOST", exit 4   -> ownership lost; abandon the item
+#                                           A FREE lock (Redis lost the key) is taken
+#                                           back with the cached token.
+#              stderr = "LOST", exit 4   -> another owner holds it; abandon the item
 #   status   [-LockName pr-1234]
 #              stdout = HELD-BY-ME | HELD | FREE, exit 0
+#              read-only; unavailable Redis returns exit 1 without starting it
+#   ping                                  (no lock name or owner needed)
+#              exit 0                    -> lock Redis answers; exit 1 -> it does not
+#   defer    -LockName pr-1234 -Fingerprint <text> [-DeferSeconds n]
+#              exit 0                    -> records that the item was deferred while its
+#                                           GitHub state matched <text>; expires after n s
+#   deferred -LockName pr-1234[,issue-56,...]
+#              stdout = one `<lock name>=<fingerprint>` line per recorded deferral; exit 0
+#   Deferral records are advisory. Start-IssuePrLoop.ps1 skips an item while its current
+#   fingerprint equals the recorded one, so an unchanged blocker is not re-examined.
 #
 # Common failure exit: 1 (docker/redis unavailable, or no cached token for
 # renew/release). 2 = bad usage / lock name or owner identity could not be resolved.
@@ -41,8 +53,11 @@
 # Lock-name resolution (renew/release/status): -LockName is OPTIONAL there. When
 # omitted it is resolved from, in order: (1) a marker persisted in the current
 # worktree's per-worktree git config (`agent.lockName`), which
-# `acquire`/`renew -Worktree` writes after enabling `extensions.worktreeConfig`;
-# then (2) an `issue-<N>-*` branch name -> `issue-<N>`. `acquire` still REQUIRES an
+# `acquire`/`renew -Worktree` writes after enabling `extensions.worktreeConfig`,
+# together with `agent.lockWorktree` (the worktree's own path). The marker counts only
+# when that path matches the current worktree: `git worktree add` copies the source
+# checkout's config.worktree, so a copied marker names another path and is ignored.
+# The main checkout never receives a marker; then (2) an `issue-<N>-*` branch name -> `issue-<N>`. `acquire` still REQUIRES an
 # explicit name (or an `issue-<N>-*` branch): it runs before the worktree exists, and
 # a PR lock's number (`pr-<N>`) is not derivable from the branch (`issue-<M>-...`).
 # For PR locks either pass -LockName to release, or write the marker once via
@@ -61,15 +76,19 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('acquire', 'release', 'renew', 'status')]
+    [ValidateSet('acquire', 'release', 'renew', 'status', 'ping', 'defer', 'deferred')]
     [string]$Verb,
 
     [string]$LockName = '',
     [string]$Worktree = '',
-    [string]$OwnerId = ''
+    [string]$OwnerId = '',
+    [string]$Fingerprint = '',
+    [ValidateRange(60, 604800)]
+    [int]$DeferSeconds = 21600
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'WorktreeCleanup.ps1')
 
 # Store absolute paths so release works from any checkout of this repository.
 if ($Worktree) { $Worktree = [IO.Path]::GetFullPath($Worktree) }
@@ -82,24 +101,26 @@ $stateRoot = Join-Path ([System.IO.Path]::GetTempPath()) 'tunit-agent-locks'
 
 function Die([int]$code, [string]$msg) { if ($msg) { [Console]::Error.WriteLine($msg) }; exit $code }
 
-function Get-WorktreeLockMarker {
-    # `git config --worktree` aliases shared local config until this extension is
-    # enabled. Skip legacy shared markers entirely so they cannot shadow issue branch
-    # derivation; every marker written by this version enables the extension first.
-    $enabled = (git config --local --bool --get extensions.worktreeConfig 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $enabled -or $enabled.Trim() -ne 'true') { return $null }
-
-    $marker = (git config --worktree --get agent.lockName 2>$null)
-    if ($LASTEXITCODE -eq 0 -and $marker) { return $marker.Trim() }
-    return $null
-}
+function Get-MarkerPath([string]$Path) { return [IO.Path]::GetFullPath($Path.Trim()).TrimEnd('\', '/') }
 
 function Set-WorktreeLockMarker([string]$Path) {
+    # The main checkout is shared, never a work item's worktree, and new worktrees
+    # inherit its config.worktree, so it never receives a marker.
+    $gitDirectory = git -C $Path rev-parse --path-format=absolute --git-dir 2>$null
+    if ($LASTEXITCODE -ne 0) { return }
+    $commonDirectory = git -C $Path rev-parse --path-format=absolute --git-common-dir 2>$null
+    if ($LASTEXITCODE -ne 0) { return }
+    $top = git -C $Path rev-parse --show-toplevel 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $top -or $gitDirectory -eq $commonDirectory) {
+        [Console]::Error.WriteLine("not writing lock marker: $Path is not a linked worktree")
+        return
+    }
     # Linked worktrees share --local config. Enable the extension in that common
     # config, then persist the marker in the target worktree's config.worktree file.
     git -C $Path config --local extensions.worktreeConfig true 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { return }
     git -C $Path config --worktree agent.lockName $LockName 2>$null | Out-Null
+    git -C $Path config --worktree agent.lockWorktree (Get-MarkerPath $top) 2>$null | Out-Null
 }
 
 function Resolve-OwnerIdentity([string]$Explicit) {
@@ -113,42 +134,57 @@ function Resolve-OwnerIdentity([string]$Explicit) {
 
 function Resolve-LockName([string]$Explicit) {
     if ($Explicit) { return $Explicit }
-    # 1. marker persisted in the current worktree by a prior `acquire`/`renew -Worktree`.
-    $marker = Get-WorktreeLockMarker
-    if ($marker) { return $marker }
-    # 2. derive issue-<N> from an issue-<N>-<desc> branch (never yields pr-<N>).
-    $branch = (git rev-parse --abbrev-ref HEAD 2>$null)
-    if ($LASTEXITCODE -eq 0 -and $branch -match '^issue-(\d+)-') { return "issue-$($Matches[1])" }
-    return $null
+    # The current worktree's marker, else issue-<N> from an issue-<N>-<desc> branch
+    # (never pr-<N>). The sweep resolves every registered worktree the same way.
+    $top = (git rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $top) { return $null }
+    try { return Get-WorktreeLockName -Worktree $top } catch { return $null }
 }
 
-$LockName = Resolve-LockName $LockName
-if (-not $LockName) {
-    Die 2 "cannot resolve lock name: pass -LockName (e.g. pr-1234 / issue-1234), or run inside an issue-<N>-* worktree"
+if ($Verb -ne 'ping') {
+    $LockName = Resolve-LockName $LockName
+    if (-not $LockName) {
+        Die 2 "cannot resolve lock name: pass -LockName (e.g. pr-1234 / issue-1234), or run inside an issue-<N>-* worktree"
+    }
 }
 
-$OwnerId = Resolve-OwnerIdentity $OwnerId
-if (-not $OwnerId) {
-    Die 2 'cannot resolve lock owner identity: pass -OwnerId or set TUNIT_AGENT_LOCK_OWNER_ID (CODEX_THREAD_ID is used automatically in Codex)'
-}
+# defer/deferred record advisory survey state, not ownership, so they need no owner.
+if ($Verb -in 'acquire', 'release', 'renew', 'status') {
+    $OwnerId = Resolve-OwnerIdentity $OwnerId
+    if (-not $OwnerId) {
+        Die 2 'cannot resolve lock owner identity: pass -OwnerId or set TUNIT_AGENT_LOCK_OWNER_ID (CODEX_THREAD_ID is used automatically in Codex)'
+    }
 
-$ownerIdBytes = [System.Text.Encoding]::UTF8.GetBytes($OwnerId)
-$ownerIdHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($ownerIdBytes)).ToLowerInvariant()
-$stateDir = Join-Path $stateRoot $ownerIdHash
+    $ownerIdBytes = [System.Text.Encoding]::UTF8.GetBytes($OwnerId)
+    $ownerIdHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($ownerIdBytes)).ToLowerInvariant()
+    $stateDir = Join-Path $stateRoot $ownerIdHash
+    $tokenFile = Join-Path $stateDir ("{0}.token" -f ($LockName -replace '[\\/:*?"<>| ]', '_'))
+}
 $lockKey = "tunit:agent-lock:$LockName"
 $metaKey = "tunit:agent-lock-meta:$LockName"
-$tokenFile = Join-Path $stateDir ("{0}.token" -f ($LockName -replace '[\\/:*?"<>| ]', '_'))
+$deferKey = "tunit:agent-defer:$LockName"
 
 function Ensure-AgentRedis {
     # One inspect tells missing vs stopped vs running: error exit = missing,
     # 'false' = stopped, 'true' = running. Warm path (the common loop case) costs
     # this single call — no separate `docker ps` or a redundant PING; the verb's
     # own Redis command is the connectivity check.
-    $running = docker inspect -f '{{.State.Running}}' $redisContainer 2>$null
-    if ($LASTEXITCODE -eq 0 -and $running -eq 'true') { return }
+    $state = docker inspect -f '{{.State.Running}} {{join .Args " "}}' $redisContainer 2>$null
+    $found = $LASTEXITCODE -eq 0
+    if ($found -and $state -like 'true *') { return }
 
-    if ($LASTEXITCODE -ne 0) {
-        docker run -d --name $redisContainer redis:7-alpine redis-server --save '' --appendonly no | Out-Null
+    # Locks and deferral records must survive a Docker restart, or a restart strips every
+    # running unit of its lock. A stopped container holds no data in memory, so replacing
+    # one created without the append-only file loses nothing. `docker rm` without -f
+    # refuses a container that another caller has just started.
+    if ($found -and ([string]$state -split ' ')[1] -eq 'redis-server' -and $state -notlike '*--appendonly yes*') {
+        docker rm $redisContainer 2>$null | Out-Null
+        $null = docker inspect -f '{{.State.Running}}' $redisContainer 2>$null
+        $found = $LASTEXITCODE -eq 0
+    }
+    if (-not $found) {
+        docker run -d --name $redisContainer --restart unless-stopped -v "${redisContainer}-data:/data" redis:7-alpine `
+            redis-server --save '' --appendonly yes --appendfsync everysec 2>$null | Out-Null
     }
     else {
         docker start $redisContainer | Out-Null
@@ -159,7 +195,11 @@ function Ensure-AgentRedis {
     }
 }
 
-function Redis { (& docker exec $redisContainer redis-cli @args | Out-String).Trim() }
+function Redis {
+    $output = & docker exec $redisContainer redis-cli @args
+    if ($LASTEXITCODE -ne 0) { Die 1 "redis command failed on $redisContainer" }
+    ($output | Out-String).Trim()
+}
 
 function New-Meta([string]$Token) {
     @{
@@ -179,7 +219,7 @@ function Read-Token {
     if ($t) { $t.Trim() } else { $null }
 }
 
-Ensure-AgentRedis
+if ($Verb -ne 'status') { Ensure-AgentRedis }
 
 switch ($Verb) {
 
@@ -202,8 +242,10 @@ switch ($Verb) {
         # persist the auto-derive marker via -Worktree. Skip entirely for normal units.
         $token = Read-Token
         if (-not $token) { Die 1 "no cached token for $LockName" }
-        # Re-arm TTL on lock + meta only if we still own the token.
-        $script = "if redis.call('GET', KEYS[1]) == ARGV[1] then local meta = cjson.decode(ARGV[3]); local previous = redis.call('GET', KEYS[2]); if meta.worktree == '' and previous then meta.worktree = cjson.decode(previous).worktree; end; redis.call('EXPIRE', KEYS[1], ARGV[2]); redis.call('SET', KEYS[2], cjson.encode(meta), 'EX', ARGV[2]); return 1; else return 0; end"
+        # Re-arm TTL on lock + meta only if we still own the token. A free lock means Redis
+        # lost the key (a restart, or a unit that ran past the TTL) and no one else took
+        # the item, so take it back with the same token. Another owner's lock is LOST.
+        $script = "local held = redis.call('GET', KEYS[1]); if held == ARGV[1] or (not held and redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])) then local meta = cjson.decode(ARGV[3]); local previous = redis.call('GET', KEYS[2]); if meta.worktree == '' and previous then meta.worktree = cjson.decode(previous).worktree; end; redis.call('EXPIRE', KEYS[1], ARGV[2]); redis.call('SET', KEYS[2], cjson.encode(meta), 'EX', ARGV[2]); return 1; else return 0; end"
         if ((Redis EVAL $script 2 $lockKey $metaKey $token $lockTtlSeconds (New-Meta $token)) -ne '1') {
             Die 4 'LOST'
         }
@@ -244,6 +286,28 @@ switch ($Verb) {
         $held = Redis GET $lockKey
         if (-not $held) { Write-Output 'FREE'; exit 0 }
         if ($held -eq (Read-Token)) { Write-Output 'HELD-BY-ME' } else { Write-Output 'HELD' }
+        exit 0
+    }
+
+    'ping' {
+        if ((Redis PING) -ne 'PONG') { Die 1 "redis PING failed on $redisContainer" }
+        exit 0
+    }
+
+    'defer' {
+        if (-not $Fingerprint) { Die 2 'defer requires -Fingerprint' }
+        if ((Redis SET $deferKey $Fingerprint EX $DeferSeconds) -ne 'OK') { Die 1 "could not record deferral for $LockName" }
+        exit 0
+    }
+
+    'deferred' {
+        # Accepts a comma-separated list so a survey checks every candidate in one call.
+        # Prints one `<lock name>=<fingerprint>` line per recorded deferral.
+        $names = @($LockName -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $keys = @($names | ForEach-Object { "tunit:agent-defer:$_" })
+        $script = "local r = {}; for i, k in ipairs(KEYS) do local v = redis.call('GET', k); if v then r[#r + 1] = ARGV[i] .. '=' .. v; end; end; return r"
+        $recorded = Redis EVAL $script $keys.Count @keys @names
+        if ($recorded) { Write-Output $recorded }
         exit 0
     }
 }

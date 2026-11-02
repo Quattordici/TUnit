@@ -6,6 +6,7 @@ using TUnit.Core.SourceGenerator.CodeGenerators;
 using TUnit.Core.SourceGenerator.Generators;
 using TUnit.Core.SourceGenerator.Tests.Extensions;
 using TUnit.Core.SourceGenerator.Tests.Options;
+using TUnit.Tests.Shared;
 
 namespace TUnit.Core.SourceGenerator.Tests;
 
@@ -20,6 +21,7 @@ public class TestsBase
     public TestsBase<HookMetadataGenerator> HooksGenerator = new();
     public TestsBase<InfrastructureGenerator> InfrastructureGenerator = new();
     public TestsBase<DynamicTestsGenerator> DynamicTestsGenerator = new();
+    public TestsBase<PropertyInjectionSourceGenerator> PropertyInjectionGenerator = new();
 
     public Task RunTest(string inputFile, Func<string[], Task> assertions)
     {
@@ -34,6 +36,9 @@ public class TestsBase
 
 public class TestsBase<TGenerator> where TGenerator : IIncrementalGenerator, new()
 {
+    // TUnit.TestProject builds with LangVersion=preview (Directory.Build.props), so fixtures must be parsed the same way.
+    private static CSharpParseOptions ParseOptions => GeneratorTestInput.ParseOptions;
+
     public Task RunTest(string inputFile, Func<string[], Task> assertions)
     {
         return RunTest(inputFile, new RunTestOptions(), assertions);
@@ -87,7 +92,12 @@ public class TestsBase<TGenerator> where TGenerator : IIncrementalGenerator, new
             """
             namespace System.Diagnostics.CodeAnalysis;
 
-            public class UnconditionalSuppressMessageAttribute : Attribute;
+            public class UnconditionalSuppressMessageAttribute(string category, string checkId) : Attribute
+            {
+                public string Category { get; } = category;
+                public string CheckId { get; } = checkId;
+                public string? Justification { get; set; }
+            }
             """,
 #if NET
             ..await Task.WhenAll(runTestOptions.AdditionalFiles.Select(x => File.ReadAllTextAsync(x))),
@@ -101,7 +111,8 @@ public class TestsBase<TGenerator> where TGenerator : IIncrementalGenerator, new
         var generator = new TGenerator();
 
         // Source generators should be tested using 'GeneratorDriver'.
-        GeneratorDriver driver = CSharpGeneratorDriver.Create(generator);
+        // Generated trees must share the input's language version, or Roslyn rejects the compilation.
+        GeneratorDriver driver = CSharpGeneratorDriver.Create([generator.AsSourceGenerator()], parseOptions: ParseOptions);
 
         if (runTestOptions.BuildProperties != null)
         {
@@ -116,12 +127,12 @@ public class TestsBase<TGenerator> where TGenerator : IIncrementalGenerator, new
         var compilation = CSharpCompilation.Create(
                 GetType().Name,
                 [
-                    CSharpSyntaxTree.ParseText(source)
+                    CSharpSyntaxTree.ParseText(source, ParseOptions)
                 ],
                 options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
             )
             .WithReferences(ReferencesHelper.References)
-            .AddSyntaxTrees(additionalSources.Select(x => CSharpSyntaxTree.ParseText(x)));
+            .AddSyntaxTrees(additionalSources.Select(x => CSharpSyntaxTree.ParseText(x, ParseOptions)));
 
         foreach (var additionalPackage in runTestOptions.AdditionalPackages)
         {
@@ -129,6 +140,8 @@ public class TestsBase<TGenerator> where TGenerator : IIncrementalGenerator, new
 
             compilation = compilation.AddReferences(downloaded);
         }
+
+        GeneratorTestInput.ThrowIfInputCannotBeParsed(compilation);
 
         // Run generators. Don't forget to use the new compilation rather than the previous one.
         driver.RunGeneratorsAndUpdateCompilation(compilation, out var newCompilation, out var diagnostics);

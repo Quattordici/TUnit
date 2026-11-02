@@ -62,14 +62,14 @@ Source generation shifts work from run time to build time: you pay a little up f
 <!-- benchmarks:start -->
 | Scenario | TUnit (AOT) | TUnit | xUnit v3 | NUnit | MSTest |
 |----------|---|---|---|---|---|
-| Data-driven tests | 26.94 ms | 337.87 ms | 785.28 ms | 631.09 ms | 569.21 ms |
-| Async-heavy tests | 118.1 ms | 398.9 ms | 807.0 ms | 757.5 ms | 749.2 ms |
-| Matrix combinations | 122.2 ms | 493.9 ms | 1,045.4 ms | 1,725.5 ms | 1,674.7 ms |
-| Large suites (scale) | 18.35 ms | 337.36 ms | 629.35 ms | 601.45 ms | 523.49 ms |
-| Massive parallelism | 226.0 ms | 702.2 ms | 1,481.3 ms | 1,473.2 ms | 3,221.1 ms |
-| Setup/teardown lifecycle | 76.99 ms | 480.42 ms | 1,050.98 ms | 1,368.52 ms | 1,313.38 ms |
+| Data-driven tests | 16.94 ms | 215.91 ms | 615.90 ms | 422.34 ms | 464.19 ms |
+| Async-heavy tests | 120.6 ms | 549.6 ms | 963.1 ms | 884.3 ms | 882.0 ms |
+| Matrix combinations | 129.6 ms | 619.3 ms | 1,305.9 ms | 1,951.7 ms | 1,774.3 ms |
+| Large suites (scale) | 29.11 ms | 504.60 ms | 1,039.88 ms | 950.59 ms | 806.55 ms |
+| Massive parallelism | 219.4 ms | 571.1 ms | 1,457.9 ms | 1,424.4 ms | 3,167.1 ms |
+| Setup/teardown lifecycle | 65.53 ms | 334.52 ms | 748.72 ms | 1,177.50 ms | 1,092.32 ms |
 
-<sub>Mean wall-clock time to run the same test suite. TUnit (AOT) 1.75.0 · TUnit 1.75.0 · xUnit v3 4.0.2 · NUnit 5.0.0 · MSTest 4.5.1. .NET SDK 10.0.402, .NET 10.0.13 (10.0.13, 10.0.1326.50504), X64 RyuJIT x86-64-v4. Updated 2026-10-18 — regenerated weekly by the [Speed Comparison workflow](https://github.com/thomhurst/TUnit/actions/workflows/speed-comparison.yml). Full results and methodology: [tunit.dev/docs/benchmarks](https://tunit.dev/docs/benchmarks/).</sub>
+<sub>Mean wall-clock time to run the same test suite. TUnit (AOT) 1.76.28 · TUnit 1.76.28 · xUnit v3 4.0.2 · NUnit 5.0.0 · MSTest 4.5.2. .NET SDK 10.0.403, .NET 10.0.14 (10.0.14, 10.0.1426.52326), X64 RyuJIT x86-64-v4. Updated 2026-11-01 — regenerated weekly by the [Speed Comparison workflow](https://github.com/thomhurst/TUnit/actions/workflows/speed-comparison.yml). Full results and methodology: [tunit.dev/docs/benchmarks](https://tunit.dev/docs/benchmarks/).</sub>
 <!-- benchmarks:end -->
 
 ## Getting Started

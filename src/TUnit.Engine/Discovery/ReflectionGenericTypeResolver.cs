@@ -16,7 +16,7 @@ internal static class ReflectionGenericTypeResolver
     /// <summary>
     /// Determines generic type arguments from data row values
     /// </summary>
-    public static Type[]? DetermineGenericTypeArguments(Type genericTypeDefinition, object?[] dataRow)
+    public static Type[]? DetermineGenericTypeArguments(Type genericTypeDefinition, IDataSourceAttribute dataSource, object?[] dataRow)
     {
 #if NET
         if (!RuntimeFeature.IsDynamicCodeSupported)
@@ -25,54 +25,153 @@ internal static class ReflectionGenericTypeResolver
         }
 #endif
 
-        var genericParameters = genericTypeDefinition.GetGenericArguments();
+        // A compile-time [Arguments] row infers through the constructor's parameter types, as the source generator
+        // infers it (#7223). Rows known only at run time use the rule source-generated mode partitions them by (#7210)
+        if (IsArgumentsAttribute(dataSource)
+            && dataRow.Length > 0
+            && InferTypeArgumentsFromConstructor(genericTypeDefinition, genericTypeDefinition.GetGenericArguments(), dataRow) is { } constructorTypeArguments)
+        {
+            return constructorTypeArguments;
+        }
 
-        // If no data row or empty data, can't determine types
-        if (dataRow.Length == 0)
+        return GenericClassRowPartition.InferClassTypeArguments(dataRow, genericTypeDefinition.GetGenericArguments().Length);
+    }
+
+    private static bool IsArgumentsAttribute(IDataSourceAttribute dataSource)
+    {
+        return dataSource is ArgumentsAttribute
+            || dataSource.GetType() is { IsGenericType: true } type && type.GetGenericTypeDefinition() == typeof(ArgumentsAttribute<>);
+    }
+
+    /// <summary>
+    /// The class type arguments a data row infers through the constructor the instance is built with (one marked
+    /// <c>[TestConstructor]</c>, as <see cref="ConstructorHelper.FindSuitableConstructor"/> picks it, and otherwise
+    /// the first public one), as the source generator infers them: each non-null value is matched against its constructor parameter's type, so a <c>string[]</c>
+    /// value for a <c>T[]</c> parameter infers <c>string</c> and a <c>List&lt;int&gt;</c> value for a
+    /// <c>List&lt;T&gt;</c> parameter infers <c>int</c> (#7223). Null when the parameters leave a type parameter
+    /// uninferred.
+    /// </summary>
+    private static Type[]? InferTypeArgumentsFromConstructor(Type genericTypeDefinition, Type[] genericParameters, object?[] dataRow)
+    {
+        if (FindRowConstructor(genericTypeDefinition) is not { } constructor)
         {
             return null;
         }
 
-        var typeArguments = new Type[genericParameters.Length];
+        var parameters = constructor.GetParameters();
+        var typeArguments = new Type?[genericParameters.Length];
+        var nullOnly = new bool[genericParameters.Length];
 
-        // For generic classes with constructors, we need to infer types from constructor parameters
-        // We should match the number of generic parameters, not the number of data items
-        if (genericParameters.Length == 1 && dataRow.Length >= 1)
+        // A T[] or List<T> value fixes T first, because it cannot bind to any other T: [Arguments((short)2, new[] { 1 })]
+        // on C<T>(T count, T[] values) infers int, which the short also binds to. A bare T then takes the first
+        // non-null value's type. Mirrors TestMetadataGenerator.InferTypesFromClassArgumentsAttribute, apart from its
+        // last-value rule for a repeated bare T (#7366).
+        for (var pass = 0; pass < 2; pass++)
         {
-            // Single generic parameter - use first non-null argument's type
-            for (var i = 0; i < dataRow.Length; i++)
+            var bareParameters = pass == 1;
+            for (var i = 0; i < dataRow.Length && i < parameters.Length; i++)
             {
-                if (dataRow[i] != null)
+                var parameterType = parameters[i].ParameterType;
+                if (parameterType.IsGenericParameter != bareParameters)
                 {
-                    typeArguments[0] = dataRow[i]!.GetType();
-                    break;
+                    continue;
                 }
-            }
 
-            // If we couldn't determine the type, return null
-            if (typeArguments[0] == null)
-            {
-                return null;
+                if (dataRow[i] is not { } value)
+                {
+                    if (bareParameters && Array.IndexOf(genericParameters, parameterType) is var nullIndex and >= 0)
+                    {
+                        nullOnly[nullIndex] = true;
+                    }
+
+                    continue;
+                }
+
+                var valueType = ReflectionTestDataCollector.GetArgumentInferenceType(value);
+                for (var j = 0; j < genericParameters.Length; j++)
+                {
+                    if (typeArguments[j] == null
+                        && MatchTypeParameter(parameterType, valueType, genericParameters[j]) is { } typeArgument)
+                    {
+                        typeArguments[j] = typeArgument;
+                    }
+                }
             }
         }
-        else
+
+        var inferredCount = 0;
+        for (var j = 0; j < genericParameters.Length; j++)
         {
-            // Multiple generic parameters - try to match one-to-one with data
-            for (var i = 0; i < genericParameters.Length; i++)
+            // A bare T that only nulls bind is object, as in the source generator. A one-value row is skipped, because
+            // [Arguments(null)] reads as one null value here and the source generator infers nothing from it.
+            if (typeArguments[j] == null && nullOnly[j] && dataRow.Length > 1)
             {
-                if (i < dataRow.Length && dataRow[i] != null)
+                typeArguments[j] = typeof(object);
+            }
+
+            if (typeArguments[j] != null)
+            {
+                inferredCount++;
+            }
+        }
+
+        return inferredCount == genericParameters.Length ? (Type[]) typeArguments! : null;
+    }
+
+    /// <summary>
+    /// The constructor a class data row binds to for type inference: the one marked <c>[TestConstructor]</c>, as
+    /// <see cref="ConstructorHelper.FindSuitableConstructor"/> picks it, and otherwise the first public one.
+    /// </summary>
+    internal static ConstructorInfo? FindRowConstructor(Type genericTypeDefinition)
+    {
+        foreach (var candidate in genericTypeDefinition.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            if (candidate.IsDefined(typeof(TestConstructorAttribute), inherit: false))
+            {
+                return candidate;
+            }
+        }
+
+        return genericTypeDefinition.GetConstructors() is [var first, ..] ? first : null;
+    }
+
+    /// <summary>
+    /// The type that <paramref name="typeParameter"/> takes when a value of <paramref name="declaredType"/> binds to a
+    /// parameter of <paramref name="parameterType"/>: the declared type itself for a parameter of type T, its element
+    /// type for T[], and the matching type argument for a constructed generic such as List&lt;T&gt;. Null when the
+    /// parameter type does not mention the type parameter or the declared type does not have its shape. Mirrors
+    /// <c>TestMetadataGenerator.MatchTypeParameter</c>.
+    /// </summary>
+    internal static Type? MatchTypeParameter(Type parameterType, Type declaredType, Type typeParameter)
+    {
+        if (parameterType.IsGenericParameter)
+        {
+            return parameterType == typeParameter ? declaredType : null;
+        }
+
+        if (parameterType.IsArray)
+        {
+            return declaredType.IsArray && declaredType.GetArrayRank() == parameterType.GetArrayRank()
+                ? MatchTypeParameter(parameterType.GetElementType()!, declaredType.GetElementType()!, typeParameter)
+                : null;
+        }
+
+        if (parameterType.IsGenericType
+            && declaredType.IsGenericType
+            && parameterType.GetGenericTypeDefinition() == declaredType.GetGenericTypeDefinition())
+        {
+            var parameterTypeArguments = parameterType.GetGenericArguments();
+            var declaredTypeArguments = declaredType.GetGenericArguments();
+            for (var i = 0; i < parameterTypeArguments.Length; i++)
+            {
+                if (MatchTypeParameter(parameterTypeArguments[i], declaredTypeArguments[i], typeParameter) is { } match)
                 {
-                    typeArguments[i] = dataRow[i]!.GetType();
-                }
-                else
-                {
-                    // Can't determine all generic types
-                    return null;
+                    return match;
                 }
             }
         }
 
-        return typeArguments;
+        return null;
     }
 
     /// <summary>
@@ -186,4 +285,207 @@ internal static class ReflectionGenericTypeResolver
 
         return genericTypeDefinition.MakeGenericType(typeArguments);
     }
+
+    /// <summary>
+    /// Describes the first generic constraint of <paramref name="genericTypeDefinition"/> that
+    /// <paramref name="typeArguments"/> break, or returns <c>null</c> when they satisfy every constraint.
+    /// The wording matches <see cref="TUnit.Engine.Services.TestGenericTypeResolver"/> and the source
+    /// generator, so both modes report the same failure message.
+    /// </summary>
+    public static string? FindConstraintViolation(Type genericTypeDefinition, Type[] typeArguments)
+    {
+        var genericParameters = genericTypeDefinition.GetGenericArguments();
+        if (genericParameters.Length != typeArguments.Length)
+        {
+            return null;
+        }
+
+        var violation = DescribeConstraintViolation(genericParameters, typeArguments);
+        if (violation != null)
+        {
+            return violation;
+        }
+
+        try
+        {
+            _ = genericTypeDefinition.MakeGenericType(typeArguments);
+            return null;
+        }
+        catch (ArgumentException)
+        {
+            return $"Type arguments '{JoinTypeNames(typeArguments)}' do not satisfy the generic constraints of type '{genericTypeDefinition.Name}'";
+        }
+    }
+
+    /// <summary>
+    /// Describes the first generic constraint of <paramref name="genericMethodDefinition"/> that
+    /// <paramref name="typeArguments"/> break, or returns <c>null</c> when they satisfy every constraint.
+    /// </summary>
+    /// <remarks>
+    /// A method constraint may name a type parameter of the declaring class
+    /// (<c>where U : IEnumerable&lt;T&gt;</c>). Its constraints still name the open class parameter even when
+    /// the method comes from a constructed class, so the class's type arguments are substituted in first,
+    /// as the source generator does.
+    /// </remarks>
+    public static string? FindConstraintViolation(MethodInfo genericMethodDefinition, Type[] typeArguments)
+    {
+        var genericParameters = genericMethodDefinition.GetGenericArguments();
+        if (genericParameters.Length != typeArguments.Length)
+        {
+            return null;
+        }
+
+        var substitutionParameters = genericParameters;
+        var substitutionArguments = typeArguments;
+        if (genericMethodDefinition.DeclaringType is { IsConstructedGenericType: true } declaringType)
+        {
+            var classGenericParameters = declaringType.GetGenericTypeDefinition().GetGenericArguments();
+            var classTypeArguments = declaringType.GenericTypeArguments;
+            if (classGenericParameters.Length == classTypeArguments.Length)
+            {
+                substitutionParameters = classGenericParameters.Concat(genericParameters).ToArray();
+                substitutionArguments = classTypeArguments.Concat(typeArguments).ToArray();
+            }
+        }
+
+        var violation = DescribeConstraintViolation(genericParameters, typeArguments, substitutionParameters, substitutionArguments);
+        if (violation != null)
+        {
+            return violation;
+        }
+
+        try
+        {
+            _ = genericMethodDefinition.MakeGenericMethod(typeArguments);
+            return null;
+        }
+        catch (ArgumentException)
+        {
+            return $"Type arguments '{JoinTypeNames(typeArguments)}' do not satisfy the generic constraints of method '{genericMethodDefinition.Name}'";
+        }
+    }
+
+    private static string? DescribeConstraintViolation(Type[] genericParameters, Type[] typeArguments)
+        => DescribeConstraintViolation(genericParameters, typeArguments, genericParameters, typeArguments);
+
+    /// <param name="genericParameters">The generic parameters whose constraints are checked.</param>
+    /// <param name="typeArguments">The type arguments for <paramref name="genericParameters"/>.</param>
+    /// <param name="substitutionParameters">Every generic parameter a constraint may name (the
+    /// declaring class's as well as <paramref name="genericParameters"/>).</param>
+    /// <param name="substitutionArguments">The type arguments for <paramref name="substitutionParameters"/>.</param>
+    private static string? DescribeConstraintViolation(Type[] genericParameters, Type[] typeArguments, Type[] substitutionParameters, Type[] substitutionArguments)
+    {
+        for (var i = 0; i < genericParameters.Length; i++)
+        {
+            var genericParameter = genericParameters[i];
+            var typeArgument = typeArguments[i];
+            var attributes = genericParameter.GenericParameterAttributes;
+
+            // Nullable<T> is a value type but never satisfies 'struct'.
+            if ((attributes & GenericParameterAttributes.NotNullableValueTypeConstraint) != 0
+                && (!typeArgument.IsValueType || Nullable.GetUnderlyingType(typeArgument) != null))
+            {
+                return $"Type '{typeArgument.Name}' does not satisfy the 'struct' constraint for generic parameter '{genericParameter.Name}'";
+            }
+
+            if ((attributes & GenericParameterAttributes.ReferenceTypeConstraint) != 0 && typeArgument.IsValueType)
+            {
+                return $"Type '{typeArgument.Name}' does not satisfy the 'class' constraint for generic parameter '{genericParameter.Name}'";
+            }
+
+            var constraints = genericParameter.GetGenericParameterConstraints();
+
+            // The base type constraint is checked before interface constraints, as in the engine. A
+            // constraint naming another generic parameter (`where T : U`) is checked against U's type
+            // argument, classified by what that argument is, as the source generator does.
+            foreach (var constraint in constraints)
+            {
+                if (constraint == typeof(ValueType))
+                {
+                    continue;
+                }
+
+                var substituted = SubstituteGenericParameters(constraint, substitutionParameters, substitutionArguments);
+                if (substituted != null && !substituted.IsInterface && !substituted.IsAssignableFrom(typeArgument))
+                {
+                    return $"Type '{typeArgument.Name}' does not satisfy the base type constraint '{substituted.Name}' for generic parameter '{genericParameter.Name}'";
+                }
+            }
+
+            foreach (var constraint in constraints)
+            {
+                var substituted = SubstituteGenericParameters(constraint, substitutionParameters, substitutionArguments);
+                if (substituted != null && substituted.IsInterface && !substituted.IsAssignableFrom(typeArgument))
+                {
+                    return $"Type '{typeArgument.Name}' does not implement interface '{substituted.Name}' required for generic parameter '{genericParameter.Name}'";
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Replaces the generic parameters in <paramref name="type"/> (for example, <c>IComparable&lt;T&gt;</c>)
+    /// with their type arguments. Returns <c>null</c> when the type cannot be constructed.
+    /// </summary>
+    private static Type? SubstituteGenericParameters(Type type, Type[] genericParameters, Type[] typeArguments)
+    {
+        if (!type.ContainsGenericParameters)
+        {
+            return type;
+        }
+
+        if (type.IsGenericParameter)
+        {
+            var index = Array.IndexOf(genericParameters, type);
+            return index >= 0 ? typeArguments[index] : null;
+        }
+
+        // An array of a generic parameter (the U[] in IEnumerable<U[]>): substitute the element type,
+        // as the source generator does, so the specific constraint message is reported.
+        if (type.IsArray)
+        {
+            var element = SubstituteGenericParameters(type.GetElementType()!, genericParameters, typeArguments);
+            if (element == null)
+            {
+                return null;
+            }
+
+#if NET
+            var isVector = type.IsSZArray;
+#else
+            var isVector = type.Name.EndsWith("[]", StringComparison.Ordinal);
+#endif
+            return isVector ? element.MakeArrayType() : element.MakeArrayType(type.GetArrayRank());
+        }
+
+        if (!type.IsGenericType)
+        {
+            return null;
+        }
+
+        var arguments = type.GetGenericArguments();
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            var substituted = SubstituteGenericParameters(arguments[i], genericParameters, typeArguments);
+            if (substituted == null)
+            {
+                return null;
+            }
+
+            arguments[i] = substituted;
+        }
+
+        try
+        {
+            return type.GetGenericTypeDefinition().MakeGenericType(arguments);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static string JoinTypeNames(Type[] types) => string.Join(", ", types.Select(static t => t.Name));
 }

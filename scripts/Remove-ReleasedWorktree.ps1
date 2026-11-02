@@ -26,7 +26,10 @@ function Remove-ReleasedWorktree {
         return
     }
     $marker = git -C $target config --worktree --get agent.lockName 2>$null
-    if ($LASTEXITCODE -ne 0 -or $marker -cne $LockName) {
+    $markerOwner = git -C $target config --worktree --get agent.lockWorktree 2>$null
+    # A marker copied in by `git worktree add` names another checkout's path.
+    if ($marker -cne $LockName -or -not $markerOwner -or
+        [IO.Path]::GetFullPath($markerOwner.Trim()).TrimEnd('\', '/') -ne $target) {
         Write-Host "Preserving worktree without a matching lock marker: $target"
         return
     }
@@ -46,27 +49,14 @@ function Remove-ReleasedWorktree {
     . (Join-Path $PSScriptRoot 'WorktreeCleanup.ps1')
     $status = @(git -C $target status --porcelain=v1 --untracked-files=all --ignored=matching 2>$null)
     if ($LASTEXITCODE -ne 0) { throw "Cannot inspect worktree: $target" }
-    foreach ($entry in $status) {
-        if ($entry -notmatch '^(\?\?|!!) ' -or -not (Test-DisposableWorktreePath $entry.Substring(3))) {
-            Write-Host "Preserving dirty worktree: $target ($entry)"
-            return
-        }
+    $work = @(Get-WorktreeUncommittedWork -Status $status)
+    if ($work.Count -gt 0) {
+        Write-Host "Preserving dirty worktree: $target ($($work[0]))"
+        return
     }
-    $head = git -C $target rev-parse HEAD 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "Cannot resolve HEAD: $target" }
-    git -C $target symbolic-ref -q HEAD 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        # A stable ref keeps unpublished detached commits reachable after Git prunes
-        # the worktree reflog. Never overwrite an existing branch.
-        $branch = "retained-worktrees/$head"
-        $existing = git -C $repo rev-parse --verify "refs/heads/$branch" 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            git -C $repo branch $branch $head
-            if ($LASTEXITCODE -ne 0) { throw "Cannot retain detached HEAD: $target" }
-        } elseif ($existing -ne $head) {
-            throw "Retention branch has moved: $branch"
-        }
-    }
+    # A stable ref keeps unpublished detached commits reachable after Git prunes the
+    # worktree reflog.
+    Save-DetachedWorktreeHead -Repo $repo -Worktree $target
     # Move this child shell out of the directory before deleting it on Windows.
     Set-Location -LiteralPath $repo
     [Environment]::CurrentDirectory = $repo

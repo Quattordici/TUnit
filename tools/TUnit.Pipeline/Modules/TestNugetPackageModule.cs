@@ -10,18 +10,21 @@ using TUnit.Pipeline.Modules.Abstract;
 
 namespace TUnit.Pipeline.Modules;
 
+[ModuleCategory(PipelineCategories.NuGetPackageTests)]
 [NotInParallel("NugetTester")]
 public class TestNugetPackageModule : AbstractTestNugetPackageModule
 {
     public override string ProjectName => "TUnit.NugetTester.csproj";
 }
 
+[ModuleCategory(PipelineCategories.NuGetPackageTests)]
 [NotInParallel("NugetTester")]
 public class TestFSharpNugetPackageModule : AbstractTestNugetPackageModule
 {
     public override string ProjectName => "TUnit.NugetTester.FSharp.fsproj";
 }
 
+[ModuleCategory(PipelineCategories.NuGetPackageTests)]
 [NotInParallel("NugetTester")]
 public class TestVBNugetPackageModule : AbstractTestNugetPackageModule
 {
@@ -41,7 +44,12 @@ public abstract class AbstractTestNugetPackageModule : TestBaseModule
         get
         {
             yield return "net10.0";
-            yield return "net8.0";
+
+            // See ModernFrameworks: only Linux covers net8.0.
+            if (IsLinux)
+            {
+                yield return "net8.0";
+            }
 
             if (IsWindows)
             {

@@ -2,6 +2,7 @@ name: Test Deploy to GitHub Pages
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
     paths:
@@ -14,6 +15,7 @@ concurrency:
 
 jobs:
   test-deploy:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Test Deploy to GitHub Pages
     runs-on: ubuntu-latest
     defaults:
@@ -25,7 +27,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v7.1.0
         with:
-          node-version: 24
+          node-version: 26
           cache: yarn
           cache-dependency-path: 'docs/yarn.lock'
 
